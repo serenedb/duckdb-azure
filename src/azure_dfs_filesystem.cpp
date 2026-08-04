@@ -370,23 +370,43 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 
 void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
                                           idx_t buffer_out_len) {
-	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
-	try {
-		// Specify the range
-		Azure::Core::Http::HttpRange range;
-		range.Offset = (int64_t)file_offset;
-		range.Length = buffer_out_len;
-		Azure::Storage::Files::DataLake::DownloadFileToOptions options;
-		options.Range = range;
-		options.TransferOptions.Concurrency = afh.options.read_transfer_concurrency;
-		options.TransferOptions.InitialChunkSize = afh.options.read_transfer_chunk_size;
-		options.TransferOptions.ChunkSize = afh.options.read_transfer_chunk_size;
-		auto res = afh.file_client.DownloadTo((uint8_t *)buffer_out, buffer_out_len, options);
+  auto& afh = handle.Cast<AzureDfsStorageFileHandle>();
+  if (buffer_out_len == 0) {
+    return;
+  }
 
-	} catch (const Azure::Storage::StorageException &e) {
-		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
-		                  e.ErrorCode, e.ReasonPhrase);
-	}
+  idx_t total_read = 0;
+  try {
+    Azure::Core::Http::HttpRange range;
+    range.Offset = (int64_t)file_offset;
+    range.Length = (int64_t)buffer_out_len;
+    Azure::Storage::Files::DataLake::DownloadFileOptions options;
+    options.Range = range;
+    auto res = afh.file_client.Download(options);
+    auto& stream = *res.Value.Body;
+    while (total_read < buffer_out_len) {
+      auto read_now =
+        stream.Read((uint8_t*)buffer_out + total_read, buffer_out_len - total_read);
+      if (read_now == 0) {
+        break;
+      }
+      total_read += read_now;
+    }
+  } catch (const Azure::Storage::StorageException& e) {
+    throw IOException(
+      "AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
+      "%s",
+      afh.path, e.ErrorCode, e.ReasonPhrase);
+  } catch (const Azure::Core::RequestFailedException& e) {
+    throw IOException("AzureDfsStorageFileSystem Read to '%s' failed: %s",
+                      afh.path, e.what());
+  }
+  if (total_read < buffer_out_len) {
+    throw IOException(
+      "AzureDfsStorageFileSystem Read to '%s' returned %llu of %llu requested "
+      "bytes",
+      afh.path, (uint64_t)total_read, (uint64_t)buffer_out_len);
+  }
 }
 
 shared_ptr<AzureContextState> AzureDfsStorageFileSystem::CreateStorageContext(optional_ptr<FileOpener> opener,

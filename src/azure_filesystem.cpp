@@ -278,16 +278,6 @@ shared_ptr<AzureContextState> AzureStorageFileSystem::GetOrCreateStorageContext(
 AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> opener) {
 	AzureOptions options;
 
-	Value concurrency_val;
-	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_transfer_concurrency", concurrency_val)) {
-		options.read_transfer_concurrency = concurrency_val.GetValue<int32_t>();
-	}
-
-	Value chunk_size_val;
-	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_transfer_chunk_size", chunk_size_val)) {
-		options.read_transfer_chunk_size = chunk_size_val.GetValue<int64_t>();
-	}
-
 	Value buffer_size_val;
 	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_buffer_size", buffer_size_val)) {
 		options.read_buffer_size = buffer_size_val.GetValue<idx_t>();

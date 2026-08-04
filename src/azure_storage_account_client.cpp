@@ -1,4 +1,5 @@
 #include "azure_storage_account_client.hpp"
+#include "azure_duckdb_transport.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
@@ -10,12 +11,9 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
-#include "http_logging_policy.hpp"
 #include "http_state_policy.hpp"
-#include <unordered_set>
 
 #include <azure/core/credentials/token_credential_options.hpp>
-#include <azure/core/http/curl_transport.hpp>
 #include <azure/core/resource_identifier.hpp>
 #include <azure/identity/azure_cli_credential.hpp>
 #include <azure/identity/chained_token_credential.hpp>
@@ -134,50 +132,6 @@ static T ToClientOptions(const Azure::Core::Http::Policies::TransportOptions &tr
 		    new UserAgentPolicy(StringUtil::Format("%s %s", db->config.UserAgent(), DuckDB::SourceID())));
 	}
 
-	// Add HTTP logging policy (per-retry, so user-agent is already set above).
-	// Logging follows DuckDB's HTTP log settings by default; azure_http_logging=false disables it.
-	Value enable_http_logging_value;
-	bool http_logging_enabled = true;
-	if (FileOpener::TryGetCurrentSetting(opener, "azure_http_logging", enable_http_logging_value)) {
-		http_logging_enabled = enable_http_logging_value.GetValue<bool>();
-	}
-	if (http_logging_enabled) {
-		auto client_context = FileOpener::TryGetClientContext(opener);
-		if (client_context && client_context->logger) {
-			// Read redaction config options
-			std::unordered_set<std::string> redact_query_params;
-			std::unordered_set<std::string> redact_headers;
-
-			Value redact_query_params_value;
-			if (FileOpener::TryGetCurrentSetting(opener, "azure_http_logging_redact_query_params",
-			                                     redact_query_params_value) &&
-			    !redact_query_params_value.IsNull()) {
-				for (auto &param : StringUtil::Split(redact_query_params_value.GetValue<std::string>(), ';')) {
-					auto trimmed = param;
-					StringUtil::Trim(trimmed);
-					if (!trimmed.empty()) {
-						redact_query_params.insert(trimmed);
-					}
-				}
-			}
-
-			Value redact_headers_value;
-			if (FileOpener::TryGetCurrentSetting(opener, "azure_http_logging_redact_headers", redact_headers_value) &&
-			    !redact_headers_value.IsNull()) {
-				for (auto &hdr : StringUtil::Split(redact_headers_value.GetValue<std::string>(), ';')) {
-					auto trimmed = hdr;
-					StringUtil::Trim(trimmed);
-					trimmed = StringUtil::Lower(trimmed);
-					if (!trimmed.empty()) {
-						redact_headers.insert(trimmed);
-					}
-				}
-			}
-
-			options.PerRetryPolicies.emplace_back(new HttpLoggingPolicy(
-			    client_context->logger, std::move(redact_query_params), std::move(redact_headers)));
-		}
-	}
 	return options;
 }
 
@@ -301,85 +255,8 @@ CreateAccessTokenCredential(const KeyValueSecret &secret) {
 	return std::make_shared<AccessTokenCredential>(access_token);
 }
 
-static std::shared_ptr<Azure::Core::Http::HttpTransport>
-CreateCurlTransport(const std::string &proxy, const std::string &proxy_username, const std::string &proxy_password) {
-	Azure::Core::Http::CurlTransportOptions curl_transport_options;
-
-	if (!proxy.empty()) {
-		curl_transport_options.Proxy = proxy;
-	}
-
-	if (!proxy_username.empty()) {
-		curl_transport_options.ProxyUsername = proxy_username;
-	}
-
-	if (!proxy_password.empty()) {
-		curl_transport_options.ProxyPassword = proxy_password;
-	}
-
-	const char *ca_info = std::getenv("CURL_CA_INFO");
-#if !defined(_WIN32) && !defined(__APPLE__)
-	if (!ca_info) {
-		// https://github.com/Azure/azure-sdk-for-cpp/issues/4983
-		// https://github.com/Azure/azure-sdk-for-cpp/issues/4738
-		for (const auto *path : {
-		         "/etc/ssl/certs/ca-certificates.crt",                // Debian/Ubuntu/Gentoo etc.
-		         "/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora/RHEL 6
-		         "/etc/ssl/ca-bundle.pem",                            // OpenSUSE
-		         "/etc/pki/tls/cacert.pem",                           // OpenELEC
-		         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // CentOS/RHEL 7
-		         "/etc/ssl/cert.pem"                                  // Alpine Linux
-		     }) {
-			if (FILE *f = fopen(path, "r")) {
-				fclose(f);
-				ca_info = path;
-				break;
-			}
-		}
-	}
-#endif
-	if (ca_info) {
-		curl_transport_options.CAInfo = ca_info;
-	}
-
-	const char *ca_path = std::getenv("CURL_CA_PATH");
-	if (ca_path) {
-		curl_transport_options.CAPath = ca_path;
-	}
-
-	return std::make_shared<Azure::Core::Http::CurlTransport>(curl_transport_options);
-}
-
-static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(const std::string &transport_option_type,
-                                                                         const std::string &proxy,
-                                                                         const std::string &proxy_username,
-                                                                         const std::string &proxy_password) {
-	Azure::Core::Http::Policies::TransportOptions transport_options;
-	if (transport_option_type == "default") {
-		if (!proxy.empty()) {
-			transport_options.HttpProxy = proxy;
-		}
-
-		if (!proxy_username.empty()) {
-			transport_options.ProxyUserName = proxy_username;
-		}
-
-		if (!proxy_password.empty()) {
-			transport_options.ProxyPassword = proxy_password;
-		}
-	} else if (transport_option_type == "curl") {
-		transport_options.Transport = CreateCurlTransport(proxy, proxy_username, proxy_password);
-	} else {
-		throw InvalidInputException("transport_option_type cannot take value '%s'", transport_option_type);
-	}
-
-	return transport_options;
-}
-
 static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(optional_ptr<FileOpener> opener,
                                                                          const KeyValueSecret &secret) {
-	auto transport_option_type = TryGetCurrentSetting(opener, "azure_transport_option_type");
-
 	std::string http_proxy;
 	auto http_proxy_val = secret.TryGetValue("http_proxy");
 	if (!http_proxy_val.IsNull()) {
@@ -404,7 +281,9 @@ static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(optiona
 		http_proxy_password = http_proxy_password_val.ToString();
 	}
 
-	return GetTransportOptions(transport_option_type, http_proxy, http_proxy_username, http_proxy_password);
+	Azure::Core::Http::Policies::TransportOptions transport_options;
+	transport_options.Transport = CreateDuckDBTransport(opener, http_proxy, http_proxy_username, http_proxy_password);
+	return transport_options;
 }
 
 static Azure::Storage::Blobs::BlobServiceClient
@@ -639,14 +518,15 @@ GetDfsStorageAccountClient(optional_ptr<FileOpener> opener, const KeyValueSecret
 }
 
 static Azure::Core::Http::Policies::TransportOptions GetTransportOptions(optional_ptr<FileOpener> opener) {
-	auto azure_transport_option_type = TryGetCurrentSetting(opener, "azure_transport_option_type");
-
 	// Load proxy options
 	auto http_proxy = TryGetCurrentSetting(opener, "azure_http_proxy");
 	auto http_proxy_user_name = TryGetCurrentSetting(opener, "azure_proxy_user_name");
 	auto http_proxy_password = TryGetCurrentSetting(opener, "azure_proxy_password");
 
-	return GetTransportOptions(azure_transport_option_type, http_proxy, http_proxy_user_name, http_proxy_password);
+	Azure::Core::Http::Policies::TransportOptions transport_options;
+	transport_options.Transport =
+	    CreateDuckDBTransport(opener, http_proxy, http_proxy_user_name, http_proxy_password);
+	return transport_options;
 }
 
 static Azure::Storage::Blobs::BlobServiceClient GetBlobStorageAccountClient(optional_ptr<FileOpener> opener,
