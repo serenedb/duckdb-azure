@@ -21,7 +21,7 @@ namespace {
 // RawResponse body stream that owns its bytes (the SDK's MemoryBodyStream does not).
 class OwningBodyStream final : public Azure::Core::IO::BodyStream {
 public:
-	explicit OwningBodyStream(std::vector<uint8_t> data_p) : data(std::move(data_p)) {
+	explicit OwningBodyStream(std::string data_p) : data(std::move(data_p)) {
 	}
 	int64_t Length() const override {
 		return static_cast<int64_t>(data.size());
@@ -39,7 +39,7 @@ private:
 		return n;
 	}
 
-	std::vector<uint8_t> data;
+	std::string data;
 	size_t offset = 0;
 };
 
@@ -109,30 +109,12 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	};
 
 	unique_ptr<HTTPResponse> response;
-	std::vector<uint8_t> body_out;
+	std::string body_out;
 	std::vector<uint8_t> body_in;
 
 	if (method == HttpMethod::Get) {
 		GetRequestInfo info(
-		    url, headers, *params,
-		    [&](const HTTPResponse &resp) {
-			    if (resp.HasHeader("Content-Length")) {
-				    auto value = resp.GetHeaderValue("Content-Length");
-				    char *end = nullptr;
-				    auto content_length = std::strtoull(value.c_str(), &end, 10);
-				    if (end != value.c_str()) {
-					    body_out.reserve(content_length);
-				    }
-			    }
-			    return true;
-		    },
-		    [&](const_data_ptr_t data, idx_t data_length) {
-			    if (context.IsCancelled()) {
-				    return false;
-			    }
-			    body_out.insert(body_out.end(), data, data + data_length);
-			    return true;
-		    });
+		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
 	} else if (method == HttpMethod::Put) {
 		body_in = DrainRequestBody(request, context);
@@ -142,7 +124,7 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		body_in = DrainRequestBody(request, context);
 		PostRequestInfo info(url, headers, *params, body_in.data(), body_in.size());
 		response = run(info);
-		body_out.assign(info.buffer_out.begin(), info.buffer_out.end());
+		body_out = std::move(info.buffer_out);
 	} else if (method == HttpMethod::Head) {
 		HeadRequestInfo info(url, headers, *params);
 		response = run(info);
@@ -167,8 +149,8 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		throw TransportException("request to '" + url + "' failed: " + response->GetError());
 	}
 
-	if (body_out.empty() && !response->body.empty()) {
-		body_out.assign(response->body.begin(), response->body.end());
+	if (body_out.empty()) {
+		body_out = std::move(response->body);
 	}
 
 	auto raw = std::make_unique<Azure::Core::Http::RawResponse>(
