@@ -145,10 +145,14 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			return;
 		}
 		ReadRange(hfh, location, (char *)buffer, to_read);
+		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
+		// Parallel readers share the handle: a positional read leaves its state alone, as pread does.
+		if (hfh.flags.RequireParallelAccess()) {
+			return;
+		}
 		hfh.buffer_available = 0;
 		hfh.buffer_idx = 0;
 		hfh.file_offset = location + nr_bytes;
-		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
 
