@@ -145,9 +145,6 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			return;
 		}
 		ReadRange(hfh, location, (char *)buffer, to_read);
-		hfh.buffer_available = 0;
-		hfh.buffer_idx = 0;
-		hfh.file_offset = location + nr_bytes;
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
@@ -202,8 +199,10 @@ int64_t AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t n
 	auto &hfh = handle.Cast<AzureFileHandle>();
 	idx_t max_read = hfh.length - hfh.file_offset;
 	nr_bytes = MinValue<idx_t>(max_read, nr_bytes);
-	Read(handle, buffer, nr_bytes, hfh.file_offset);
+	const auto location = hfh.file_offset;
+	Read(handle, buffer, nr_bytes, location);
 	// LOG handled in Read()
+	hfh.file_offset = location + nr_bytes;
 	return nr_bytes;
 }
 
