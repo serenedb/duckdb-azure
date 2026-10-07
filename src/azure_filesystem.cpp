@@ -145,9 +145,6 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			return;
 		}
 		ReadRange(hfh, location, (char *)buffer, to_read);
-		hfh.buffer_available = 0;
-		hfh.buffer_idx = 0;
-		hfh.file_offset = location + nr_bytes;
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
@@ -202,8 +199,10 @@ int64_t AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t n
 	auto &hfh = handle.Cast<AzureFileHandle>();
 	idx_t max_read = hfh.length - hfh.file_offset;
 	nr_bytes = MinValue<idx_t>(max_read, nr_bytes);
-	Read(handle, buffer, nr_bytes, hfh.file_offset);
+	const auto location = hfh.file_offset;
+	Read(handle, buffer, nr_bytes, location);
 	// LOG handled in Read()
+	hfh.file_offset = location + nr_bytes;
 	return nr_bytes;
 }
 
@@ -277,16 +276,6 @@ shared_ptr<AzureContextState> AzureStorageFileSystem::GetOrCreateStorageContext(
 
 AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> opener) {
 	AzureOptions options;
-
-	Value concurrency_val;
-	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_transfer_concurrency", concurrency_val)) {
-		options.read_transfer_concurrency = concurrency_val.GetValue<int32_t>();
-	}
-
-	Value chunk_size_val;
-	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_transfer_chunk_size", chunk_size_val)) {
-		options.read_transfer_chunk_size = chunk_size_val.GetValue<int64_t>();
-	}
 
 	Value buffer_size_val;
 	if (FileOpener::TryGetCurrentSetting(opener, "azure_read_buffer_size", buffer_size_val)) {
