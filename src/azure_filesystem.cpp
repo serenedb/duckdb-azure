@@ -79,6 +79,7 @@ bool AzureStorageFileSystem::LoadFileInfo(AzureFileHandle &handle) {
 			return false;
 		}
 		throw IOException(
+		    {{"status_code", std::to_string(int(e.StatusCode))}},
 		    "AzureStorageFileSystem open file '%s' failed with code '%s', Reason Phrase: '%s', Message: '%s'",
 		    handle.path, e.ErrorCode, e.ReasonPhrase, e.Message);
 	} catch (const IOException &e) {

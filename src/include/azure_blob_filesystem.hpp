@@ -57,8 +57,10 @@ public:
 	bool CanHandleFile(const string &fpath) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
 	}
-	bool DirectoryExists(const string &dirname, optional_ptr<FileOpener> opener) override;
-	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	FileExistence TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
+	                                 optional_ptr<ErrorData> error) override;
+	FileExistence TryFileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr,
+	                            optional_ptr<ErrorData> error = nullptr) override;
 	string GetName() const override {
 		return "AzureBlobStorageFileSystem";
 	}

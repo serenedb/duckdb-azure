@@ -349,7 +349,8 @@ void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	}
 }
 
-bool AzureBlobStorageFileSystem::DirectoryExists(const string &dirname, optional_ptr<FileOpener> opener) {
+FileExistence AzureBlobStorageFileSystem::TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
+                                                             optional_ptr<ErrorData> error) {
 	// NOTE: existance of directory makes no sense in Blob -- since the concept isn't present.
 	// That said we fake it -- if glob(dir/*) returns anything at all, say it exists, otherwise not.
 	// If we want to, could add an option to behave in this, way, always return true or even always false.
@@ -360,29 +361,34 @@ bool AzureBlobStorageFileSystem::DirectoryExists(const string &dirname, optional
 	}
 	// auto handle = OpenFile(dirname, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
 	auto dir_slashed = dirname[dirname.length() - 1] == '/' ? dirname : (dirname + '/');
-	auto dir_url = ParseUrl(dir_slashed);
-	auto storage_context = GetOrCreateStorageContext(opener, dirname, dir_url);
-	auto container_client = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(dir_url.container);
-
-	Azure::Storage::Blobs::ListBlobsOptions options;
-	options.Prefix = dir_url.path;
-	Azure::Storage::Blobs::ListBlobsPagedResponse res;
 	try {
-		res = container_client.ListBlobs(options);
+		auto dir_url = ParseUrl(dir_slashed);
+		auto storage_context = GetOrCreateStorageContext(opener, dirname, dir_url);
+		auto container_client = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(dir_url.container);
+
+		Azure::Storage::Blobs::ListBlobsOptions options;
+		options.Prefix = dir_url.path;
+		auto res = container_client.ListBlobs(options);
+		return res.Blobs.empty() ? FileExistence::MISSING : FileExistence::EXISTS;
 	} catch (Azure::Storage::StorageException &e) {
-		throw IOException("AzureBlobStorageFileSystem Read to %s failed with %s Reason Phrase: %s", dir_slashed,
-		                  e.ErrorCode, e.ReasonPhrase);
+		return ClassifyExistenceFailure(
+		    IOException({{"status_code", std::to_string(int(e.StatusCode))}},
+		                "AzureBlobStorageFileSystem Read to %s failed with %s Reason Phrase: %s", dir_slashed,
+		                e.ErrorCode, e.ReasonPhrase),
+		    error);
+	} catch (std::exception &ex) {
+		return ClassifyExistenceFailure(ex, error);
 	}
-	return !res.Blobs.empty();
 }
 
-bool AzureBlobStorageFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
-	auto handle = OpenFile(filename, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
-	if (handle != nullptr) {
-		auto &sfh = handle->Cast<AzureBlobStorageFileHandle>();
-		return sfh.length >= 0; // aka return true; -- avoid optimizers and shenanigans -- deref handle to be sure
+FileExistence AzureBlobStorageFileSystem::TryFileExists(const string &filename, optional_ptr<FileOpener> opener,
+                                                        optional_ptr<ErrorData> error) {
+	try {
+		auto handle = OpenFile(filename, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
+		return handle ? FileExistence::EXISTS : FileExistence::MISSING;
+	} catch (std::exception &ex) {
+		return ClassifyExistenceFailure(ex, error);
 	}
-	return false;
 }
 
 void AzureBlobStorageFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {

@@ -186,9 +186,15 @@ bool AzureDfsStorageFileSystem::CanHandleFile(const string &fpath) {
 	return IsDfsScheme(fpath);
 }
 
-bool AzureDfsStorageFileSystem::DirectoryExists(const string &dirname, optional_ptr<FileOpener> opener) {
-	auto handle = OpenFile(dirname, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
-	return handle && handle->Cast<AzureDfsStorageFileHandle>().GetType() == FileType::FILE_TYPE_DIR;
+FileExistence AzureDfsStorageFileSystem::TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
+                                                            optional_ptr<ErrorData> error) {
+	try {
+		auto handle = OpenFile(dirname, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
+		const bool is_dir = handle && handle->Cast<AzureDfsStorageFileHandle>().GetType() == FileType::FILE_TYPE_DIR;
+		return is_dir ? FileExistence::EXISTS : FileExistence::MISSING;
+	} catch (std::exception &ex) {
+		return ClassifyExistenceFailure(ex, error);
+	}
 }
 
 void AzureDfsStorageFileSystem::CreateDirectory(const string &dirname, optional_ptr<FileOpener> opener) {
@@ -201,9 +207,16 @@ void AzureDfsStorageFileSystem::CreateDirectory(const string &dirname, optional_
 	file_system_client.GetDirectoryClient(dir_url.path).Create();
 }
 
-bool AzureDfsStorageFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
-	auto handle = OpenFile(filename, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
-	return handle && handle->Cast<AzureDfsStorageFileHandle>().GetType() == FileType::FILE_TYPE_REGULAR;
+FileExistence AzureDfsStorageFileSystem::TryFileExists(const string &filename, optional_ptr<FileOpener> opener,
+                                                       optional_ptr<ErrorData> error) {
+	try {
+		auto handle = OpenFile(filename, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
+		const bool is_file =
+		    handle && handle->Cast<AzureDfsStorageFileHandle>().GetType() == FileType::FILE_TYPE_REGULAR;
+		return is_file ? FileExistence::EXISTS : FileExistence::MISSING;
+	} catch (std::exception &ex) {
+		return ClassifyExistenceFailure(ex, error);
+	}
 }
 
 void AzureDfsStorageFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
