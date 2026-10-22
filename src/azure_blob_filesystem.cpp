@@ -20,6 +20,7 @@
 #include <azure/storage/blobs.hpp>
 #include <azure/storage/blobs/blob_options.hpp>
 
+#include <chrono>
 #include <cstdlib>
 
 namespace duckdb {
@@ -411,6 +412,40 @@ bool AzureBlobStorageFileSystem::TryRemoveFile(const string &filename, optional_
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 	auto blob_client = container.GetBlockBlobClient(url.path);
 	return blob_client.DeleteIfExists().Value.Deleted;
+}
+
+void AzureBlobStorageFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
+	if (source == target) {
+		return;
+	}
+	auto source_url = ParseUrl(source);
+	auto target_url = ParseUrl(target);
+	auto source_context = GetOrCreateStorageContext(opener, source, source_url);
+	auto target_context = GetOrCreateStorageContext(opener, target, target_url);
+	auto source_blob = source_context->As<AzureBlobContextState>()
+	                       .GetBlobContainerClient(source_url.container)
+	                       .GetBlockBlobClient(source_url.path);
+	auto target_blob = target_context->As<AzureBlobContextState>()
+	                       .GetBlobContainerClient(target_url.container)
+	                       .GetBlockBlobClient(target_url.path);
+	try {
+		const auto size = source_blob.GetProperties().Value.BlobSize;
+		auto copy = target_blob.StartCopyFromUri(source_blob.GetUrl());
+		if (!copy.IsDone()) {
+			copy.PollUntilDone(std::chrono::milliseconds(50));
+		}
+		if (target_blob.GetProperties().Value.BlobSize != size) {
+			throw IOException("AzureBlobStorageFileSystem copy of '%s' to '%s' did not produce the blob; the source is "
+			                  "kept",
+			                  source, target);
+		}
+		source_blob.Delete();
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem move of '%s' to '%s' failed with %s Reason Phrase: %s", source,
+		                  target, e.ErrorCode, e.ReasonPhrase);
+	} catch (const Azure::Core::RequestFailedException &e) {
+		throw IOException("AzureBlobStorageFileSystem move of '%s' to '%s' failed: %s", source, target, e.what());
+	}
 }
 
 void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
