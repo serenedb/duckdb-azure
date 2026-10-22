@@ -38,9 +38,14 @@ public:
 	void Close() override;
 	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
 	void FinishStaging(ErrorData error) noexcept;
+	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
+	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient();
+	void SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client);
+	optional_ptr<DatabaseInstance> Database() const {
+		return db;
+	}
 
 public:
-	Azure::Storage::Blobs::BlockBlobClient blob_client;
 	size_t committed_block_count = 0; // maintain position while open; only used if Sync() called before Close()
 	uint32_t staged_block_count = 0;
 	BufferHandle write_buffer;
@@ -51,6 +56,8 @@ private:
 	void AwaitStagingNoThrow() noexcept;
 
 	optional_ptr<DatabaseInstance> db;
+	annotated_mutex blob_client_lock;
+	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> blob_client DUCKDB_GUARDED_BY(blob_client_lock);
 	annotated_mutex staging_lock;
 	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
 	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
