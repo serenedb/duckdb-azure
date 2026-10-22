@@ -107,6 +107,7 @@ void AzureBlobStorageFileHandle::Sync() {
 		}
 		auto res = blob_client.CommitBlockList(all_ids);
 		last_modified = AzureBlobStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureBlobStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {
@@ -428,6 +429,9 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 		range.Length = (int64_t)buffer_out_len;
 		Azure::Storage::Blobs::DownloadBlobOptions options;
 		options.Range = range;
+		if (!afh.etag.empty()) {
+			options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
+		}
 		auto res = afh.blob_client.Download(options);
 		auto &stream = *res.Value.BodyStream;
 		while (total_read < buffer_out_len) {
@@ -438,6 +442,12 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			total_read += read_now;
 		}
 	} catch (const Azure::Storage::StorageException &e) {
+		if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
+			throw IOException(
+			    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
+			    "ETag is no longer %s",
+			    afh.path, afh.etag);
+		}
 		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
 		                  e.ErrorCode, e.ReasonPhrase);
 	} catch (const Azure::Core::RequestFailedException &e) {
