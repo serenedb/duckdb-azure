@@ -73,6 +73,8 @@ public:
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
+	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
 public:

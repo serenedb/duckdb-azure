@@ -9,6 +9,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
@@ -18,6 +19,7 @@
 #include <azure/core/base64.hpp>
 #include <azure/core/io/body_stream.hpp>
 #include <azure/storage/blobs.hpp>
+#include <azure/storage/blobs/blob_batch.hpp>
 #include <azure/storage/blobs/blob_options.hpp>
 
 #include <chrono>
@@ -412,6 +414,75 @@ bool AzureBlobStorageFileSystem::TryRemoveFile(const string &filename, optional_
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 	auto blob_client = container.GetBlockBlobClient(url.path);
 	return blob_client.DeleteIfExists().Value.Deleted;
+}
+
+void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener) {
+	static constexpr idx_t MAX_BATCH_SIZE = 256;
+	struct ContainerBlobs {
+		Azure::Storage::Blobs::BlobContainerClient container;
+		vector<string> names;
+	};
+	unordered_map<string, ContainerBlobs> containers;
+	for (auto &filename : filenames) {
+		auto url = ParseUrl(filename);
+		auto storage_context = GetOrCreateStorageContext(opener, filename, url);
+		auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+		auto key = container.GetUrl();
+		auto entry = containers.find(key);
+		if (entry == containers.end()) {
+			entry = containers.emplace(std::move(key), ContainerBlobs {std::move(container), {}}).first;
+		}
+		entry->second.names.push_back(std::move(url.path));
+	}
+	for (auto &entry : containers) {
+		auto &blobs = entry.second;
+		for (idx_t begin = 0; begin < blobs.names.size(); begin += MAX_BATCH_SIZE) {
+			const auto end = MinValue<idx_t>(begin + MAX_BATCH_SIZE, blobs.names.size());
+			auto batch = blobs.container.CreateBatch();
+			vector<Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>> deletes;
+			deletes.reserve(end - begin);
+			for (idx_t i = begin; i < end; i++) {
+				deletes.push_back(batch.DeleteBlob(blobs.names[i]));
+			}
+			try {
+				blobs.container.SubmitBatch(batch);
+				for (auto &deleted : deletes) {
+					try {
+						deleted.GetResponse();
+					} catch (const Azure::Storage::StorageException &e) {
+						if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+							throw;
+						}
+					}
+				}
+			} catch (const Azure::Storage::StorageException &e) {
+				throw IOException("AzureBlobStorageFileSystem delete of %llu blobs in '%s' failed with %s Reason "
+				                  "Phrase: %s",
+				                  end - begin, entry.first, e.ErrorCode, e.ReasonPhrase);
+			}
+		}
+	}
+}
+
+void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	vector<string> filenames;
+	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	auto url = ParseUrl(prefix);
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	Azure::Storage::Blobs::ListBlobsOptions options;
+	options.Prefix = url.path;
+	try {
+		for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
+			for (auto &blob : page.Blobs) {
+				filenames.push_back(prefix + blob.Name.substr(url.path.size()));
+			}
+		}
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
+	RemoveFiles(filenames, opener);
 }
 
 void AzureBlobStorageFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
