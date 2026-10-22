@@ -5,6 +5,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
@@ -28,19 +29,31 @@ class AzureBlobStorageFileSystem;
 class AzureBlobStorageFileHandle : public AzureFileHandle {
 public:
 	AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info, FileOpenFlags flags,
-	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client);
-	~AzureBlobStorageFileHandle() override = default;
+	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client,
+	                           optional_ptr<DatabaseInstance> db);
+	~AzureBlobStorageFileHandle() override;
 
 	void StageWriteBuffer();
 	void Sync();
 	void Close() override;
+	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
+	void FinishStaging(ErrorData error) noexcept;
 
 public:
 	Azure::Storage::Blobs::BlockBlobClient blob_client;
 	size_t committed_block_count = 0; // maintain position while open; only used if Sync() called before Close()
 	uint32_t staged_block_count = 0;
-	duckdb::unique_ptr<data_t[]> write_buffer;
+	BufferHandle write_buffer;
 	idx_t write_buffer_offset = 0;
+
+private:
+	void AwaitStaging(idx_t limit);
+	void AwaitStagingNoThrow() noexcept;
+
+	optional_ptr<DatabaseInstance> db;
+	annotated_mutex staging_lock;
+	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
+	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
 };
 
 class AzureBlobStorageFileSystem : public AzureStorageFileSystem {

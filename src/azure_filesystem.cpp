@@ -298,6 +298,11 @@ AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> 
 		options.write_staged_blocks_per_commit = write_staged_blocks_per_commit_val.GetValue<idx_t>();
 	}
 
+	Value write_blocks_in_flight_val;
+	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_blocks_in_flight", write_blocks_in_flight_val)) {
+		options.write_blocks_in_flight = write_blocks_in_flight_val.GetValue<idx_t>();
+	}
+
 	return options;
 }
 
