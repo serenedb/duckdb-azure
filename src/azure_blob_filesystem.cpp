@@ -14,6 +14,7 @@
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_file_opener.hpp"
 #include "include/azure_blob_filesystem.hpp"
 
 #include <azure/core/base64.hpp>
@@ -114,6 +115,16 @@ AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSyste
                                                        optional_ptr<DatabaseInstance> db_p)
     : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), blob_client(std::move(blob_client)),
       db(db_p) {
+}
+
+Azure::Storage::Blobs::BlockBlobClient AzureBlobStorageFileHandle::ReadClient() {
+	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
+	return read_client ? *read_client : blob_client;
+}
+
+void AzureBlobStorageFileHandle::SetReadClient(Azure::Storage::Blobs::BlockBlobClient client) {
+	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
+	read_client = make_uniq<Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
 }
 
 AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
@@ -643,35 +654,49 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 	// Transport failures are retried below (duckdb retry + SDK RetryPolicy);
 	// a delivered-but-short body is deterministic, so it fails immediately.
 	idx_t total_read = 0;
-	try {
-		Azure::Core::Http::HttpRange range;
-		range.Offset = (int64_t)file_offset;
-		range.Length = (int64_t)buffer_out_len;
-		Azure::Storage::Blobs::DownloadBlobOptions options;
-		options.Range = range;
-		if (!afh.etag.empty()) {
-			options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
-		}
-		auto res = afh.blob_client.Download(options);
-		auto &stream = *res.Value.BodyStream;
-		while (total_read < buffer_out_len) {
-			auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
-			if (read_now == 0) {
-				break;
+	for (bool reconnected = false;; reconnected = true) {
+		try {
+			Azure::Core::Http::HttpRange range;
+			range.Offset = (int64_t)file_offset;
+			range.Length = (int64_t)buffer_out_len;
+			Azure::Storage::Blobs::DownloadBlobOptions options;
+			options.Range = range;
+			if (!afh.etag.empty()) {
+				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			total_read += read_now;
+			auto res = afh.ReadClient().Download(options);
+			auto &stream = *res.Value.BodyStream;
+			while (total_read < buffer_out_len) {
+				auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
+				if (read_now == 0) {
+					break;
+				}
+				total_read += read_now;
+			}
+			break;
+		} catch (const Azure::Storage::StorageException &e) {
+			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
+				throw IOException(
+				    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
+				    "ETag is no longer %s",
+				    afh.path, afh.etag);
+			}
+			// A secret replaced since the handle opened, for one whose credentials expired, signs the retry
+			if (!reconnected && e.StatusCode == Azure::Core::Http::HttpStatusCode::Forbidden && afh.Database()) {
+				DatabaseFileOpener opener(*afh.Database());
+				auto parsed_url = ParseUrl(afh.path);
+				auto context = GetOrCreateStorageContext(&opener, afh.path, parsed_url);
+				afh.SetReadClient(context->As<AzureBlobContextState>()
+				                      .GetBlobContainerClient(parsed_url.container)
+				                      .GetBlockBlobClient(parsed_url.path));
+				total_read = 0;
+				continue;
+			}
+			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
+			                  e.ErrorCode, e.ReasonPhrase);
+		} catch (const Azure::Core::RequestFailedException &e) {
+			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 		}
-	} catch (const Azure::Storage::StorageException &e) {
-		if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
-			throw IOException(
-			    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
-			    "ETag is no longer %s",
-			    afh.path, afh.etag);
-		}
-		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
-		                  e.ErrorCode, e.ReasonPhrase);
-	} catch (const Azure::Core::RequestFailedException &e) {
-		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 	}
 	if (total_read < buffer_out_len) {
 		throw IOException("AzureBlobStorageFileSystem Read to '%s' returned %llu of %llu requested bytes", afh.path,
