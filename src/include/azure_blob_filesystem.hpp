@@ -3,8 +3,10 @@
 #include "azure_filesystem.hpp"
 #include "azure_parsed_url.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
@@ -28,12 +30,15 @@ class AzureBlobStorageFileSystem;
 class AzureBlobStorageFileHandle : public AzureFileHandle {
 public:
 	AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info, FileOpenFlags flags,
-	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client);
-	~AzureBlobStorageFileHandle() override = default;
+	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client,
+	                           optional_ptr<DatabaseInstance> db);
+	~AzureBlobStorageFileHandle() override;
 
 	void StageWriteBuffer();
 	void Sync();
 	void Close() override;
+	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
+	void FinishStaging(string error) noexcept;
 
 public:
 	Azure::Storage::Blobs::BlockBlobClient blob_client;
@@ -41,6 +46,15 @@ public:
 	uint32_t staged_block_count = 0;
 	duckdb::unique_ptr<data_t[]> write_buffer;
 	idx_t write_buffer_offset = 0;
+
+private:
+	void AwaitStaging(idx_t limit);
+	void AwaitStagingNoThrow() noexcept;
+
+	optional_ptr<DatabaseInstance> db;
+	annotated_mutex staging_lock;
+	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
+	string staging_error DUCKDB_GUARDED_BY(staging_lock);
 };
 
 class AzureBlobStorageFileSystem : public AzureStorageFileSystem {
@@ -77,6 +91,8 @@ public:
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
+	ProducerToken &UploadProducer(DatabaseInstance &db);
+
 public:
 	static const string SCHEME;
 	static const string SHORT_SCHEME;
@@ -95,6 +111,10 @@ protected:
 	                                         optional_ptr<FileOpener> opener) override;
 
 	void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+
+private:
+	annotated_mutex upload_producer_lock;
+	unique_ptr<ProducerToken> upload_producer DUCKDB_GUARDED_BY(upload_producer_lock);
 };
 
 } // namespace duckdb
