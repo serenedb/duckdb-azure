@@ -9,6 +9,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
@@ -18,6 +19,7 @@
 #include <azure/core/base64.hpp>
 #include <azure/core/io/body_stream.hpp>
 #include <azure/storage/blobs.hpp>
+#include <azure/storage/blobs/blob_batch.hpp>
 #include <azure/storage/blobs/blob_options.hpp>
 
 #include <cstdlib>
@@ -59,6 +61,46 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 		pattern++;
 	}
 	return key == key_end && pattern == pattern_end;
+}
+
+static void ForEachBlob(const Azure::Storage::Blobs::BlobContainerClient &container, const string &prefix,
+                        const std::function<void(Azure::Storage::Blobs::Models::BlobItem &blob)> &callback) {
+	Azure::Storage::Blobs::ListBlobsOptions options;
+	options.Prefix = prefix;
+	for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
+		for (auto &blob : page.Blobs) {
+			callback(blob);
+		}
+	}
+}
+
+static void DeleteBlobs(const Azure::Storage::Blobs::BlobContainerClient &container, const vector<string> &names) {
+	static constexpr idx_t MAX_BATCH_SIZE = 256;
+	for (idx_t begin = 0; begin < names.size(); begin += MAX_BATCH_SIZE) {
+		const auto end = MinValue<idx_t>(begin + MAX_BATCH_SIZE, names.size());
+		auto batch = container.CreateBatch();
+		vector<Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>> deletes;
+		deletes.reserve(end - begin);
+		for (idx_t i = begin; i < end; i++) {
+			deletes.push_back(batch.DeleteBlob(names[i]));
+		}
+		try {
+			container.SubmitBatch(batch);
+			for (auto &deleted : deletes) {
+				try {
+					deleted.GetResponse();
+				} catch (const Azure::Storage::StorageException &e) {
+					if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+						throw;
+					}
+				}
+			}
+		} catch (const Azure::Storage::StorageException &e) {
+			throw IOException("AzureBlobStorageFileSystem delete of %llu blobs in '%s' failed with %s Reason "
+			                  "Phrase: %s",
+			                  end - begin, container.GetUrl(), e.ErrorCode, e.ReasonPhrase);
+		}
+	}
 }
 
 //////// AzureBlobContextState ////////
@@ -247,46 +289,43 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 	set<string> seen_dirs;
 
 	bool rv = false;
-	const Azure::Storage::Blobs::ListBlobsOptions options = {/* .Prefix = */ url.path};
 	// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 	// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 	// (struct BlobItemDetails) and
 	// https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs
-	for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
-		for (auto &blob : page.Blobs) {
-			// blob list returns _full paths_, so chop off the prefix first
-			auto child = blob.Name.substr(url.path.size());
-			// file case
-			auto slash_pos = child.find('/');
-			if (slash_pos == string::npos) {
+	ForEachBlob(container, url.path, [&](Azure::Storage::Blobs::Models::BlobItem &blob) {
+		// blob list returns _full paths_, so chop off the prefix first
+		auto child = blob.Name.substr(url.path.size());
+		// file case
+		auto slash_pos = child.find('/');
+		if (slash_pos == string::npos) {
+			rv = true;
+			OpenFileInfo info(child);
+			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			auto &options = info.extended_info->options;
+			options.emplace("type", Value("file"));
+			options.emplace("file_size", Value::BIGINT(blob.BlobSize));
+			options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
+			auto etag = StripETagQuotes(blob.Details.ETag.ToString());
+			if (!etag.empty()) {
+				options.emplace("etag", Value(std::move(etag)));
+			}
+			callback(info);
+		} else {
+			// chop off slash + tail, take the remainder and treat as directory, caching it in seen to avoid repeat.
+			auto dir = child.substr(0, slash_pos);
+			if (seen_dirs.find(dir) == seen_dirs.end()) {
 				rv = true;
-				OpenFileInfo info(child);
+				seen_dirs.insert(dir);
+				OpenFileInfo info(dir);
 				info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
 				auto &options = info.extended_info->options;
-				options.emplace("type", Value("file"));
-				options.emplace("file_size", Value::BIGINT(blob.BlobSize));
+				options.emplace("type", Value("directory"));
 				options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-				auto etag = StripETagQuotes(blob.Details.ETag.ToString());
-				if (!etag.empty()) {
-					options.emplace("etag", Value(std::move(etag)));
-				}
 				callback(info);
-			} else {
-				// chop off slash + tail, take the remainder and treat as directory, caching it in seen to avoid repeat.
-				auto dir = child.substr(0, slash_pos);
-				if (seen_dirs.find(dir) == seen_dirs.end()) {
-					rv = true;
-					seen_dirs.insert(dir);
-					OpenFileInfo info(dir);
-					info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-					auto &options = info.extended_info->options;
-					options.emplace("type", Value("directory"));
-					options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-					callback(info);
-				}
 			}
 		}
-	}
+	});
 	return rv;
 }
 
@@ -410,6 +449,51 @@ bool AzureBlobStorageFileSystem::TryRemoveFile(const string &filename, optional_
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 	auto blob_client = container.GetBlockBlobClient(url.path);
 	return blob_client.DeleteIfExists().Value.Deleted;
+}
+
+void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener) {
+	struct ContainerBlobs {
+		//! The file the storage context of the container is resolved for
+		const string &filename;
+		AzureParsedUrl url;
+		vector<string> names;
+	};
+	unordered_map<string, ContainerBlobs> containers;
+	for (auto &filename : filenames) {
+		auto url = ParseUrl(filename);
+		string key;
+		if (!url.is_fully_qualified) {
+			auto secret = LookupSecret(opener, filename);
+			if (secret.HasMatch()) {
+				key = secret.GetSecret().GetName().GetIdentifierName();
+			}
+		}
+		key += '/' + url.storage_account_name + '.' + url.endpoint + '/' + url.container;
+		auto entry = containers.try_emplace(std::move(key), filename, url).first;
+		entry->second.names.push_back(url.path);
+	}
+	for (auto &entry : containers) {
+		auto &blobs = entry.second;
+		auto storage_context = GetOrCreateStorageContext(opener, blobs.filename, blobs.url);
+		DeleteBlobs(storage_context->As<AzureBlobContextState>().GetBlobContainerClient(blobs.url.container),
+		            blobs.names);
+	}
+}
+
+void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	vector<string> names;
+	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	auto url = ParseUrl(prefix);
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	try {
+		ForEachBlob(container, url.path,
+		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { names.push_back(std::move(blob.Name)); });
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
+	DeleteBlobs(container, names);
 }
 
 void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
