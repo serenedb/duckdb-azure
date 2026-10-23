@@ -167,23 +167,20 @@ static ProducerToken &UploadProducer(DatabaseInstance &db) {
 
 AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info,
                                                        FileOpenFlags flags, const AzureOptions &opts,
-                                                       Azure::Storage::Blobs::BlockBlobClient blob_client,
+                                                       Azure::Storage::Blobs::BlockBlobClient blob_client_p,
                                                        optional_ptr<DatabaseInstance> db_p)
-    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), blob_client(std::move(blob_client)),
-      db(db_p) {
+    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), db(db_p),
+      blob_client(make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(blob_client_p))) {
 }
 
-shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> AzureBlobStorageFileHandle::ReadClient() {
-	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
-	if (!read_client) {
-		read_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(blob_client);
-	}
-	return read_client;
+shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> AzureBlobStorageFileHandle::BlobClient() {
+	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
+	return blob_client;
 }
 
-void AzureBlobStorageFileHandle::SetReadClient(Azure::Storage::Blobs::BlockBlobClient client) {
-	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
-	read_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
+void AzureBlobStorageFileHandle::SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client) {
+	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
+	blob_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
 }
 
 AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
@@ -194,7 +191,7 @@ void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_p
 	string error;
 	try {
 		auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
-		blob_client.StageBlock(block_id, body_stream);
+		BlobClient()->StageBlock(block_id, body_stream);
 	} catch (const Azure::Storage::StorageException &e) {
 		error =
 		    StringUtil::Format("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s",
@@ -252,7 +249,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	write_buffer_offset = 0;
 	if (!db || options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
 		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.get(), size);
-		blob_client.StageBlock(block_id, body_stream); // throws on error
+		BlobClient()->StageBlock(block_id, body_stream); // throws on error
 		staged_block_count++;
 		return;
 	}
@@ -282,7 +279,7 @@ void AzureBlobStorageFileHandle::Sync() {
 		for (uint32_t i = 0; i < total; i++) {
 			all_ids.push_back(MakeBlockId(i));
 		}
-		auto res = blob_client.CommitBlockList(all_ids);
+		auto res = BlobClient()->CommitBlockList(all_ids);
 		last_modified = AzureBlobStorageFileSystem::ToTimestamp(res.Value.LastModified);
 		etag = AzureBlobStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
@@ -492,13 +489,13 @@ void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	};
 
 	auto create_file = [&]() {
-		auto res_create = afh.blob_client.CommitBlockList({});
+		auto res_create = afh.BlobClient()->CommitBlockList({});
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
 
 	try {
-		auto res_props = afh.blob_client.GetProperties();
+		auto res_props = afh.BlobClient()->GetProperties();
 		if (afh.flags.ExclusiveCreate()) {
 			throw IOException("AzureBlobStorageFileSystem will not open file: '%s', ExclusiveCreate specified "
 			                  "while file already exists.");
@@ -694,7 +691,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			if (!afh.etag.empty()) {
 				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			auto res = afh.ReadClient()->Download(options);
+			auto res = afh.BlobClient()->Download(options);
 			auto &stream = *res.Value.BodyStream;
 			while (total_read < buffer_out_len) {
 				auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
@@ -716,7 +713,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 				DatabaseFileOpener opener(*afh.Database());
 				auto parsed_url = ParseUrl(afh.path);
 				auto context = GetOrCreateStorageContext(&opener, afh.path, parsed_url);
-				afh.SetReadClient(context->As<AzureBlobContextState>()
+				afh.SetBlobClient(context->As<AzureBlobContextState>()
 				                      .GetBlobContainerClient(parsed_url.container)
 				                      .GetBlockBlobClient(parsed_url.path));
 				total_read = 0;
