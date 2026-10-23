@@ -6,7 +6,6 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
-#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
@@ -99,8 +98,6 @@ public:
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
-	ProducerToken &UploadProducer(DatabaseInstance &db);
-
 public:
 	static const string SCHEME;
 	static const string SHORT_SCHEME;
@@ -119,10 +116,6 @@ protected:
 	                                         optional_ptr<FileOpener> opener) override;
 
 	void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
-
-private:
-	annotated_mutex upload_producer_lock;
-	unique_ptr<ProducerToken> upload_producer DUCKDB_GUARDED_BY(upload_producer_lock);
 };
 
 } // namespace duckdb

@@ -16,6 +16,8 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_file_opener.hpp"
 #include "include/azure_blob_filesystem.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <azure/core/base64.hpp>
 #include <azure/core/io/body_stream.hpp>
@@ -138,6 +140,31 @@ private:
 	bool ran = false;
 };
 
+//! The queue of the blocks staged on the async threads: an object of the database, which goes before its scheduler
+class AzureUploadProducer : public ObjectCacheEntry {
+public:
+	explicit AzureUploadProducer(TaskScheduler &scheduler) : token(scheduler.CreateProducer()) {
+	}
+
+	static string ObjectType() {
+		return "azure_upload_producer";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+
+	const unique_ptr<ProducerToken> token;
+};
+
+static ProducerToken &UploadProducer(DatabaseInstance &db) {
+	auto producer = db.GetObjectCache().GetOrCreate<AzureUploadProducer>(AzureUploadProducer::ObjectType(),
+	                                                                     TaskScheduler::GetScheduler(db));
+	return *producer->token;
+}
+
 AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info,
                                                        FileOpenFlags flags, const AzureOptions &opts,
                                                        Azure::Storage::Blobs::BlockBlobClient blob_client,
@@ -236,9 +263,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	}
 	staged_block_count++;
 	auto task = make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::move(write_buffer), size);
-	auto &azure_fs = file_system.Cast<AzureBlobStorageFileSystem>();
-	TaskScheduler::GetScheduler(*db).ScheduleTask(azure_fs.UploadProducer(*db), std::move(task),
-	                                              TaskSchedulerType::ASYNC);
+	TaskScheduler::GetScheduler(*db).ScheduleTask(UploadProducer(*db), std::move(task), TaskSchedulerType::ASYNC);
 }
 
 void AzureBlobStorageFileHandle::Sync() {
@@ -563,14 +588,6 @@ bool AzureBlobStorageFileSystem::TryRemoveFile(const string &filename, optional_
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 	auto blob_client = container.GetBlockBlobClient(url.path);
 	return blob_client.DeleteIfExists().Value.Deleted;
-}
-
-ProducerToken &AzureBlobStorageFileSystem::UploadProducer(DatabaseInstance &db) {
-	annotated_lock_guard<annotated_mutex> guard(upload_producer_lock);
-	if (!upload_producer) {
-		upload_producer = TaskScheduler::GetScheduler(db).CreateProducer();
-	}
-	return *upload_producer;
 }
 
 void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener) {
