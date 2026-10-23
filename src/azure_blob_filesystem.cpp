@@ -556,10 +556,7 @@ void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, op
 		auto storage_context = GetOrCreateStorageContext(opener, filename, url);
 		auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 		auto key = container.GetUrl();
-		auto entry = containers.find(key);
-		if (entry == containers.end()) {
-			entry = containers.emplace(std::move(key), ContainerBlobs {std::move(container), {}}).first;
-		}
+		auto entry = containers.try_emplace(std::move(key), std::move(container), vector<string> {}).first;
 		entry->second.names.push_back(std::move(url.path));
 	}
 	for (auto &entry : containers) {
