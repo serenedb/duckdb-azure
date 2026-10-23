@@ -65,6 +65,35 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 	return key == key_end && pattern == pattern_end;
 }
 
+static void DeleteBlobs(const Azure::Storage::Blobs::BlobContainerClient &container, const vector<string> &names) {
+	static constexpr idx_t MAX_BATCH_SIZE = 256;
+	for (idx_t begin = 0; begin < names.size(); begin += MAX_BATCH_SIZE) {
+		const auto end = MinValue<idx_t>(begin + MAX_BATCH_SIZE, names.size());
+		auto batch = container.CreateBatch();
+		vector<Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>> deletes;
+		deletes.reserve(end - begin);
+		for (idx_t i = begin; i < end; i++) {
+			deletes.push_back(batch.DeleteBlob(names[i]));
+		}
+		try {
+			container.SubmitBatch(batch);
+			for (auto &deleted : deletes) {
+				try {
+					deleted.GetResponse();
+				} catch (const Azure::Storage::StorageException &e) {
+					if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+						throw;
+					}
+				}
+			}
+		} catch (const Azure::Storage::StorageException &e) {
+			throw IOException("AzureBlobStorageFileSystem delete of %llu blobs in '%s' failed with %s Reason "
+			                  "Phrase: %s",
+			                  end - begin, container.GetUrl(), e.ErrorCode, e.ReasonPhrase);
+		}
+	}
+}
+
 //////// AzureBlobContextState ////////
 AzureBlobContextState::AzureBlobContextState(Azure::Storage::Blobs::BlobServiceClient client,
                                              const AzureOptions &options)
@@ -545,52 +574,36 @@ ProducerToken &AzureBlobStorageFileSystem::UploadProducer(DatabaseInstance &db) 
 }
 
 void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener) {
-	static constexpr idx_t MAX_BATCH_SIZE = 256;
 	struct ContainerBlobs {
-		Azure::Storage::Blobs::BlobContainerClient container;
+		//! The file the storage context of the container is resolved for
+		const string &filename;
+		AzureParsedUrl url;
 		vector<string> names;
 	};
 	unordered_map<string, ContainerBlobs> containers;
 	for (auto &filename : filenames) {
 		auto url = ParseUrl(filename);
-		auto storage_context = GetOrCreateStorageContext(opener, filename, url);
-		auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
-		auto key = container.GetUrl();
-		auto entry = containers.try_emplace(std::move(key), std::move(container), vector<string> {}).first;
-		entry->second.names.push_back(std::move(url.path));
+		string key;
+		if (!url.is_fully_qualified) {
+			auto secret = LookupSecret(opener, filename);
+			if (secret.HasMatch()) {
+				key = secret.GetSecret().GetName().GetIdentifierName();
+			}
+		}
+		key += '/' + url.storage_account_name + '.' + url.endpoint + '/' + url.container;
+		auto entry = containers.try_emplace(std::move(key), filename, url).first;
+		entry->second.names.push_back(url.path);
 	}
 	for (auto &entry : containers) {
 		auto &blobs = entry.second;
-		for (idx_t begin = 0; begin < blobs.names.size(); begin += MAX_BATCH_SIZE) {
-			const auto end = MinValue<idx_t>(begin + MAX_BATCH_SIZE, blobs.names.size());
-			auto batch = blobs.container.CreateBatch();
-			vector<Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>> deletes;
-			deletes.reserve(end - begin);
-			for (idx_t i = begin; i < end; i++) {
-				deletes.push_back(batch.DeleteBlob(blobs.names[i]));
-			}
-			try {
-				blobs.container.SubmitBatch(batch);
-				for (auto &deleted : deletes) {
-					try {
-						deleted.GetResponse();
-					} catch (const Azure::Storage::StorageException &e) {
-						if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
-							throw;
-						}
-					}
-				}
-			} catch (const Azure::Storage::StorageException &e) {
-				throw IOException("AzureBlobStorageFileSystem delete of %llu blobs in '%s' failed with %s Reason "
-				                  "Phrase: %s",
-				                  end - begin, entry.first, e.ErrorCode, e.ReasonPhrase);
-			}
-		}
+		auto storage_context = GetOrCreateStorageContext(opener, blobs.filename, blobs.url);
+		DeleteBlobs(storage_context->As<AzureBlobContextState>().GetBlobContainerClient(blobs.url.container),
+		            blobs.names);
 	}
 }
 
 void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
-	vector<string> filenames;
+	vector<string> names;
 	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
 	auto url = ParseUrl(prefix);
 	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
@@ -600,14 +613,14 @@ void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, option
 	try {
 		for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
 			for (auto &blob : page.Blobs) {
-				filenames.push_back(prefix + blob.Name.substr(url.path.size()));
+				names.push_back(std::move(blob.Name));
 			}
 		}
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
 		                  e.ErrorCode, e.ReasonPhrase);
 	}
-	RemoveFiles(filenames, opener);
+	DeleteBlobs(container, names);
 }
 
 void AzureBlobStorageFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
