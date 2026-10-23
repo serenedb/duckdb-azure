@@ -117,14 +117,17 @@ AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSyste
       db(db_p) {
 }
 
-Azure::Storage::Blobs::BlockBlobClient AzureBlobStorageFileHandle::ReadClient() {
+shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> AzureBlobStorageFileHandle::ReadClient() {
 	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
-	return read_client ? *read_client : blob_client;
+	if (!read_client) {
+		read_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(blob_client);
+	}
+	return read_client;
 }
 
 void AzureBlobStorageFileHandle::SetReadClient(Azure::Storage::Blobs::BlockBlobClient client) {
 	annotated_lock_guard<annotated_mutex> guard(read_client_lock);
-	read_client = make_uniq<Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
+	read_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
 }
 
 AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
@@ -664,7 +667,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			if (!afh.etag.empty()) {
 				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			auto res = afh.ReadClient().Download(options);
+			auto res = afh.ReadClient()->Download(options);
 			auto &stream = *res.Value.BodyStream;
 			while (total_read < buffer_out_len) {
 				auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
