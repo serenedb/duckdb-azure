@@ -60,6 +60,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Does not affect the 50,000-block blob limit; increase azure_write_block_size for that.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(default_options.write_staged_blocks_per_commit));
 
+	config.AddExtensionOption("azure_write_blocks_in_flight",
+	                          "Blocks of one blob write staged at the same time, on the async threads; 1 stages each "
+	                          "block from the write that fills it.",
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_options.write_blocks_in_flight));
+
 	auto *http_proxy = std::getenv("HTTP_PROXY");
 	Value default_http_value = http_proxy ? Value(http_proxy) : Value(nullptr);
 	config.AddExtensionOption("azure_http_proxy",

@@ -52,12 +52,11 @@ AzureFileHandle::AzureFileHandle(AzureStorageFileSystem &fs, const OpenFileInfo 
 		if (entry3 != opts.end()) {
 			etag = StringValue::Get(entry3->second);
 		}
-		// When glob supplied the full metadata triplet for a read, skip the HEAD (GetProperties) on open.
 		// Exclude trailing-slash paths: those follow the S3/Azure "foo/" dir-marker convention and must
 		// still be resolved to FILE_TYPE_DIR by LoadRemoteFileInfo rather than pre-typed as a regular file.
-		const bool have_all = entry1 != opts.end() && entry2 != opts.end() && entry3 != opts.end();
 		const bool looks_like_dir = !info.path.empty() && info.path.back() == '/';
-		if (have_all && !looks_like_dir && flags.OpenForReading() && !flags.OpenForWriting()) {
+		if (entry1 != opts.end() && entry3 != opts.end() && !looks_like_dir && flags.OpenForReading() &&
+		    !flags.OpenForWriting()) {
 			file_type = FileType::FILE_TYPE_REGULAR;
 			is_remote_loaded = true;
 		}
@@ -296,6 +295,11 @@ AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> 
 	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_staged_blocks_per_commit",
 	                                     write_staged_blocks_per_commit_val)) {
 		options.write_staged_blocks_per_commit = write_staged_blocks_per_commit_val.GetValue<idx_t>();
+	}
+
+	Value write_blocks_in_flight_val;
+	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_blocks_in_flight", write_blocks_in_flight_val)) {
+		options.write_blocks_in_flight = write_blocks_in_flight_val.GetValue<idx_t>();
 	}
 
 	return options;
