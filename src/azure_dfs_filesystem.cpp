@@ -302,7 +302,7 @@ vector<OpenFileInfo> AzureDfsStorageFileSystem::Glob(const string &path, FileOpe
 
 bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
                                                   const std::function<void(OpenFileInfo &info)> &callback,
-                                                  optional_ptr<FileOpener> opener) {
+                                                  optional_ptr<FileOpener> opener, const ListFilesOptions &listing) {
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
@@ -314,8 +314,11 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 
 	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
 	bool rv = false;
-	for (auto page = dir_client.ListPaths(false); page.HasPage(); page.MoveToNextPage()) {
+	for (auto page = dir_client.ListPaths(listing.recursive); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &child : page.Paths) {
+			if (listing.recursive && child.IsDirectory) {
+				continue;
+			}
 			rv = true;
 			// Strangely, the DataLake API returns whole path, where the Blob API (correctly?)
 			// only returns the child name without prefix.
