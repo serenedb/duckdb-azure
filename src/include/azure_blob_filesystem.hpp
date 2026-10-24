@@ -3,6 +3,7 @@
 #include "azure_filesystem.hpp"
 #include "azure_parsed_url.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -38,7 +39,7 @@ public:
 	void Sync();
 	void Close() override;
 	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
-	void FinishStaging(string error) noexcept;
+	void FinishStaging(ErrorData error) noexcept;
 	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
 	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient();
 	void SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client);
@@ -61,7 +62,7 @@ private:
 	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> blob_client DUCKDB_GUARDED_BY(blob_client_lock);
 	annotated_mutex staging_lock;
 	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
-	string staging_error DUCKDB_GUARDED_BY(staging_lock);
+	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
 };
 
 class AzureBlobStorageFileSystem : public AzureStorageFileSystem {

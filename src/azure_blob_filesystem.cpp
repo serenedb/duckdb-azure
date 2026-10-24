@@ -109,6 +109,10 @@ AzureBlobContextState::GetBlobContainerClient(const std::string &blobContainerNa
 }
 
 //////// AzureBlobStorageFileHandle ////////
+static ErrorData StagingError(const IOException &error) {
+	return ErrorData(error, std::make_exception_ptr(error));
+}
+
 class AzureStageBlockTask : public Task {
 public:
 	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, BufferHandle data_p, idx_t size_p)
@@ -117,7 +121,8 @@ public:
 
 	~AzureStageBlockTask() override {
 		if (!ran) {
-			handle.FinishStaging(StringUtil::Format("a block of '%s' was dropped before it was staged", handle.path));
+			handle.FinishStaging(
+			    StagingError(IOException("a block of '%s' was dropped before it was staged", handle.path)));
 		}
 	}
 
@@ -188,23 +193,26 @@ AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
 }
 
 void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept {
-	string error;
+	ErrorData error;
 	try {
 		auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
 		BlobClient()->StageBlock(block_id, body_stream);
 	} catch (const Azure::Storage::StorageException &e) {
-		error =
-		    StringUtil::Format("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s",
-		                       path, e.ErrorCode, e.ReasonPhrase);
+		error = StagingError(
+		    IOException("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s", path,
+		                e.ErrorCode, e.ReasonPhrase));
+	} catch (const Exception &e) {
+		error = ErrorData(e);
 	} catch (const std::exception &e) {
-		error = StringUtil::Format("AzureBlobStorageFileSystem staging a block of '%s' failed: %s", path, e.what());
+		error =
+		    StagingError(IOException("AzureBlobStorageFileSystem staging a block of '%s' failed: %s", path, e.what()));
 	}
 	FinishStaging(std::move(error));
 }
 
-void AzureBlobStorageFileHandle::FinishStaging(string error) noexcept {
+void AzureBlobStorageFileHandle::FinishStaging(ErrorData error) noexcept {
 	annotated_lock_guard<annotated_mutex> guard(staging_lock);
-	if (!error.empty() && staging_error.empty()) {
+	if (error.HasError() && !staging_error.HasError()) {
 		staging_error = std::move(error);
 	}
 	D_ASSERT(blocks_in_flight > 0);
@@ -212,7 +220,7 @@ void AzureBlobStorageFileHandle::FinishStaging(string error) noexcept {
 }
 
 void AzureBlobStorageFileHandle::AwaitStaging(idx_t limit) {
-	string error;
+	ErrorData error;
 	{
 		annotated_unique_lock<annotated_mutex> guard(staging_lock);
 		auto ready = [&]() DUCKDB_NO_THREAD_SAFETY_ANALYSIS {
@@ -222,10 +230,12 @@ void AzureBlobStorageFileHandle::AwaitStaging(idx_t limit) {
 			TaskScheduler::BlockingScope blocking;
 			staging_lock.Await(absl::Condition(&ready));
 		}
-		error = staging_error;
+		if (staging_error.HasError()) {
+			error = staging_error;
+		}
 	}
-	if (!error.empty()) {
-		throw IOException(error);
+	if (error.HasError()) {
+		error.Throw();
 	}
 }
 
