@@ -79,6 +79,25 @@ static void ForEachBlob(const Azure::Storage::Blobs::BlobContainerClient &contai
 	}
 }
 
+static bool ListBlob(const Azure::Storage::Blobs::Models::BlobItem &blob, idx_t prefix_size,
+                     const std::function<void(OpenFileInfo &info)> &callback) {
+	OpenFileInfo info(blob.Name.substr(prefix_size));
+	if (info.path.empty() || info.path.back() == '/') {
+		return false;
+	}
+	info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	auto &options = info.extended_info->options;
+	options.emplace("type", Value("file"));
+	options.emplace("file_size", Value::BIGINT(blob.BlobSize));
+	options.emplace("last_modified", Value::TIMESTAMP(AzureStorageFileSystem::ToTimestamp(blob.Details.LastModified)));
+	auto etag = AzureStorageFileSystem::StripETagQuotes(blob.Details.ETag.ToString());
+	if (!etag.empty()) {
+		options.emplace("etag", Value(std::move(etag)));
+	}
+	callback(info);
+	return true;
+}
+
 static void DeleteBlobs(const Azure::Storage::Blobs::BlobContainerClient &container, const vector<string> &names) {
 	static constexpr idx_t MAX_BATCH_SIZE = 256;
 	for (idx_t begin = 0; begin < names.size(); begin += MAX_BATCH_SIZE) {
@@ -441,7 +460,6 @@ vector<OpenFileInfo> AzureBlobStorageFileSystem::Glob(const string &path, FileOp
 	return result;
 }
 
-// Caller beware -- this is always recursive, performance may be terrible.
 bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
                                                    const std::function<void(OpenFileInfo &info)> &callback,
                                                    optional_ptr<FileOpener> opener) {
@@ -454,50 +472,46 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 	auto storage_context = GetOrCreateStorageContext(opener, path, url);
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 
-	// NOTE: this code fakes dir listings by keeping a small cache of seen directories. Since blob store has no such
-	// concept, it's up to us to track and release them in the result. This plays a role in overwrite detection, so
-	// we do the work here.
-	set<string> seen_dirs;
-
 	bool rv = false;
 	// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 	// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 	// (struct BlobItemDetails) and
 	// https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs
-	ForEachBlob(container, url.path, [&](Azure::Storage::Blobs::Models::BlobItem &blob) {
-		// blob list returns _full paths_, so chop off the prefix first
-		auto child = blob.Name.substr(url.path.size());
-		// file case
-		auto slash_pos = child.find('/');
-		if (slash_pos == string::npos) {
-			rv = true;
-			OpenFileInfo info(child);
-			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-			auto &options = info.extended_info->options;
-			options.emplace("type", Value("file"));
-			options.emplace("file_size", Value::BIGINT(blob.BlobSize));
-			options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-			auto etag = StripETagQuotes(blob.Details.ETag.ToString());
-			if (!etag.empty()) {
-				options.emplace("etag", Value(std::move(etag)));
-			}
-			callback(info);
-		} else {
-			// chop off slash + tail, take the remainder and treat as directory, caching it in seen to avoid repeat.
-			auto dir = child.substr(0, slash_pos);
-			if (seen_dirs.find(dir) == seen_dirs.end()) {
-				rv = true;
-				seen_dirs.insert(dir);
-				OpenFileInfo info(dir);
-				info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-				auto &options = info.extended_info->options;
-				options.emplace("type", Value("directory"));
-				options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-				callback(info);
-			}
+	Azure::Storage::Blobs::ListBlobsOptions list_options;
+	list_options.Prefix = url.path;
+	for (auto page = container.ListBlobsByHierarchy("/", list_options); page.HasPage(); page.MoveToNextPage()) {
+		for (auto &blob : page.Blobs) {
+			rv = ListBlob(blob, url.path.size(), callback) || rv;
 		}
-	});
+		for (auto &prefix : page.BlobPrefixes) {
+			OpenFileInfo info(prefix.substr(url.path.size()));
+			StringUtil::RTrim(info.path, "/");
+			if (info.path.empty()) {
+				continue;
+			}
+			rv = true;
+			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			info.extended_info->options.emplace("type", Value("directory"));
+			callback(info);
+		}
+	}
 	return rv;
+}
+
+void AzureBlobStorageFileSystem::ListFilesRecursive(const string &directory,
+                                                    const std::function<void(OpenFileInfo &info)> &callback,
+                                                    optional_ptr<FileOpener> opener) {
+	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	auto url = ParseUrl(prefix);
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	try {
+		ForEachBlob(container, url.path,
+		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { ListBlob(blob, url.path.size(), callback); });
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
 }
 
 void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
