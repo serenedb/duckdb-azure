@@ -6,6 +6,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
@@ -48,7 +49,7 @@ public:
 public:
 	size_t committed_block_count = 0; // maintain position while open; only used if Sync() called before Close()
 	uint32_t staged_block_count = 0;
-	duckdb::unique_ptr<data_t[]> write_buffer;
+	BufferHandle write_buffer;
 	idx_t write_buffer_offset = 0;
 
 private:

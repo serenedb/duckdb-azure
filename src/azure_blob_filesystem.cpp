@@ -17,6 +17,7 @@
 #include "duckdb/main/database_file_opener.hpp"
 #include "include/azure_blob_filesystem.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <azure/core/base64.hpp>
@@ -110,8 +111,7 @@ AzureBlobContextState::GetBlobContainerClient(const std::string &blobContainerNa
 //////// AzureBlobStorageFileHandle ////////
 class AzureStageBlockTask : public Task {
 public:
-	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, duckdb::unique_ptr<data_t[]> data_p,
-	                    idx_t size_p)
+	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, BufferHandle data_p, idx_t size_p)
 	    : handle(handle_p), block_id(std::move(block_id_p)), data(std::move(data_p)), size(size_p) {
 	}
 
@@ -123,8 +123,8 @@ public:
 
 	TaskExecutionResult Execute(TaskExecutionMode mode) override {
 		ran = true;
-		handle.StageBlock(block_id, data.get(), size);
-		data.reset();
+		handle.StageBlock(block_id, data.Ptr(), size);
+		data.Destroy();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
 
@@ -135,7 +135,7 @@ public:
 private:
 	AzureBlobStorageFileHandle &handle;
 	string block_id;
-	duckdb::unique_ptr<data_t[]> data;
+	BufferHandle data;
 	idx_t size;
 	bool ran = false;
 };
@@ -248,7 +248,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	const auto size = write_buffer_offset;
 	write_buffer_offset = 0;
 	if (!db || options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
-		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.get(), size);
+		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.Ptr(), size);
 		BlobClient()->StageBlock(block_id, body_stream); // throws on error
 		staged_block_count++;
 		return;
@@ -763,12 +763,13 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 	idx_t remaining = static_cast<idx_t>(nr_bytes);
 
 	while (remaining > 0) {
-		if (!afh.write_buffer) {
-			afh.write_buffer = duckdb::unique_ptr<data_t[]>(new data_t[block_size]);
+		if (!afh.write_buffer.IsValid()) {
+			afh.write_buffer =
+			    BufferManager::GetBufferManager(*afh.Database()).Allocate(MemoryTag::EXTENSION, block_size);
 		}
 		idx_t space = block_size - afh.write_buffer_offset;
 		idx_t to_copy = MinValue<idx_t>(space, remaining);
-		memcpy(afh.write_buffer.get() + afh.write_buffer_offset, src, to_copy);
+		memcpy(afh.write_buffer.GetDataMutable() + afh.write_buffer_offset, src, to_copy);
 		afh.write_buffer_offset += to_copy;
 		src += to_copy;
 		remaining -= to_copy;
