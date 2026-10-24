@@ -665,15 +665,11 @@ void AzureBlobStorageFileSystem::MoveFile(const string &source, const string &ta
 	                       .GetBlobContainerClient(target_url.container)
 	                       .GetBlockBlobClient(target_url.path);
 	try {
-		const auto size = source_blob.GetProperties().Value.BlobSize;
 		auto copy = target_blob.StartCopyFromUri(source_blob.GetUrl());
-		if (!copy.IsDone()) {
+		auto &headers = copy.GetRawResponse().GetHeaders();
+		auto copy_status = headers.find("x-ms-copy-status");
+		if (copy_status == headers.end() || copy_status->second != "success") {
 			copy.PollUntilDone(std::chrono::milliseconds(50));
-		}
-		if (target_blob.GetProperties().Value.BlobSize != size) {
-			throw IOException("AzureBlobStorageFileSystem copy of '%s' to '%s' did not produce the blob; the source is "
-			                  "kept",
-			                  source, target);
 		}
 		source_blob.Delete();
 	} catch (const Azure::Storage::StorageException &e) {
