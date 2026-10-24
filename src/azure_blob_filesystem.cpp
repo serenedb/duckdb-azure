@@ -180,7 +180,7 @@ void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_p
 	ErrorData error;
 	try {
 		auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
-		BlobClient()->StageBlock(block_id, body_stream);
+		BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(), staging_context);
 	} catch (const Azure::Storage::StorageException &e) {
 		error = StagingError(
 		    IOException("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s", path,
@@ -263,6 +263,9 @@ void AzureBlobStorageFileHandle::Sync() {
 	if (!(flags.OpenForWriting() || flags.OpenForAppending())) {
 		return;
 	}
+	if (aborted) {
+		throw IOException("Cannot sync '%s': its write was aborted", path);
+	}
 	try {
 		StageWriteBuffer();
 		AwaitStaging(0);
@@ -286,8 +289,22 @@ void AzureBlobStorageFileHandle::Sync() {
 }
 
 void AzureBlobStorageFileHandle::Close() {
+	if (aborted) {
+		return;
+	}
 	Sync();
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void AzureBlobStorageFileHandle::Abort() {
+	if (aborted) {
+		return;
+	}
+	AzureFileHandle::Abort();
+	staging_context.Cancel();
+	AwaitStagingNoThrow();
+	write_buffer.Destroy();
+	write_buffer_offset = 0;
 }
 
 //////// AzureBlobStorageFileSystem ////////
@@ -706,6 +723,9 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
+	}
+	if (afh.aborted) {
+		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
 	}
 
 	D_ASSERT(location == afh.file_offset);

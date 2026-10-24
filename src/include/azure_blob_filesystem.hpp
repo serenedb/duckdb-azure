@@ -7,6 +7,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
 
+#include <azure/core/context.hpp>
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
 #include <azure/storage/blobs/block_blob_client.hpp>
@@ -36,6 +37,7 @@ public:
 	void StageWriteBuffer();
 	void Sync();
 	void Close() override;
+	void Abort() override;
 	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
 	void FinishStaging(ErrorData error) noexcept;
 	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
@@ -56,6 +58,7 @@ private:
 	void AwaitStagingNoThrow() noexcept;
 
 	optional_ptr<DatabaseInstance> db;
+	Azure::Core::Context staging_context;
 	annotated_mutex blob_client_lock;
 	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> blob_client DUCKDB_GUARDED_BY(blob_client_lock);
 	annotated_mutex staging_lock;
