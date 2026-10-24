@@ -126,6 +126,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 	if (!(flags.OpenForWriting() || flags.OpenForAppending())) {
 		return;
 	}
+	if (aborted) {
+		throw IOException("Cannot sync '%s': its write was aborted", path);
+	}
 	try {
 		StageWriteBuffer();
 		if (staged_block_count == 0 && !close) {
@@ -143,8 +146,17 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 }
 
 void AzureDfsStorageFileHandle::Close() {
+	if (aborted) {
+		return;
+	}
 	Sync(true);
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void AzureDfsStorageFileHandle::Abort() {
+	AzureFileHandle::Abort();
+	write_buffer.reset();
+	write_buffer_offset = 0;
 }
 
 //////// AzureDfsStorageFileSystem ////////
@@ -441,6 +453,9 @@ void AzureDfsStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
+	}
+	if (afh.aborted) {
+		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
 	}
 
 	if (location != afh.file_offset || location != afh.length) {

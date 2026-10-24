@@ -34,6 +34,7 @@ public:
 	void StageWriteBuffer();
 	void Sync(bool close = false);
 	void Close() override;
+	void Abort() override;
 
 public:
 	Azure::Storage::Files::DataLake::DataLakeFileClient file_client;
