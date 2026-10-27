@@ -324,6 +324,7 @@ void AzureBlobStorageFileHandle::Sync() {
 		}
 		auto res = BlobClient()->CommitBlockList(all_ids);
 		last_modified = AzureBlobStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureBlobStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {

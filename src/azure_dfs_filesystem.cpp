@@ -154,7 +154,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 		}
 		Azure::Storage::Files::DataLake::FlushFileOptions flush_opts;
 		flush_opts.Close = close;
-		file_client.Flush(staged_offset, flush_opts);
+		auto res = file_client.Flush(staged_offset, flush_opts);
+		last_modified = AzureStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {
