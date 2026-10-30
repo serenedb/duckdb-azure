@@ -9,17 +9,24 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_file_opener.hpp"
 #include "include/azure_blob_filesystem.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <azure/core/base64.hpp>
 #include <azure/core/io/body_stream.hpp>
 #include <azure/storage/blobs.hpp>
+#include <azure/storage/blobs/blob_batch.hpp>
 #include <azure/storage/blobs/blob_options.hpp>
 
+#include <chrono>
 #include <cstdlib>
 
 namespace duckdb {
@@ -61,6 +68,65 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 	return key == key_end && pattern == pattern_end;
 }
 
+static void ForEachBlob(const Azure::Storage::Blobs::BlobContainerClient &container, const string &prefix,
+                        const std::function<void(Azure::Storage::Blobs::Models::BlobItem &blob)> &callback) {
+	Azure::Storage::Blobs::ListBlobsOptions options;
+	options.Prefix = prefix;
+	for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
+		for (auto &blob : page.Blobs) {
+			callback(blob);
+		}
+	}
+}
+
+static bool ListBlob(const Azure::Storage::Blobs::Models::BlobItem &blob, idx_t prefix_size,
+                     const std::function<void(OpenFileInfo &info)> &callback) {
+	OpenFileInfo info(blob.Name.substr(prefix_size));
+	if (info.path.empty() || info.path.back() == '/') {
+		return false;
+	}
+	info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	auto &options = info.extended_info->options;
+	options.emplace("type", Value("file"));
+	options.emplace("file_size", Value::BIGINT(blob.BlobSize));
+	options.emplace("last_modified", Value::TIMESTAMP(AzureStorageFileSystem::ToTimestamp(blob.Details.LastModified)));
+	auto etag = AzureStorageFileSystem::StripETagQuotes(blob.Details.ETag.ToString());
+	if (!etag.empty()) {
+		options.emplace("etag", Value(std::move(etag)));
+	}
+	callback(info);
+	return true;
+}
+
+static void DeleteBlobs(const Azure::Storage::Blobs::BlobContainerClient &container, const vector<string> &names) {
+	static constexpr idx_t MAX_BATCH_SIZE = 256;
+	for (idx_t begin = 0; begin < names.size(); begin += MAX_BATCH_SIZE) {
+		const auto end = MinValue<idx_t>(begin + MAX_BATCH_SIZE, names.size());
+		auto batch = container.CreateBatch();
+		vector<Azure::Storage::DeferredResponse<Azure::Storage::Blobs::Models::DeleteBlobResult>> deletes;
+		deletes.reserve(end - begin);
+		for (idx_t i = begin; i < end; i++) {
+			deletes.push_back(batch.DeleteBlob(names[i]));
+		}
+		try {
+			container.SubmitBatch(batch);
+			for (auto &deleted : deletes) {
+				try {
+					deleted.GetResponse();
+				} catch (const Azure::Storage::StorageException &e) {
+					if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+						throw;
+					}
+				}
+			}
+		} catch (const Azure::Storage::StorageException &e) {
+			throw IOException("AzureBlobStorageFileSystem delete of %llu blobs in '%s' failed with %s Reason "
+			                  "Phrase: %s",
+			                  end - begin, container.GetUrl(), e.ErrorCode, e.ReasonPhrase);
+		}
+	}
+}
+
 //////// AzureBlobContextState ////////
 AzureBlobContextState::AzureBlobContextState(Azure::Storage::Blobs::BlobServiceClient client,
                                              const AzureOptions &options)
@@ -73,10 +139,145 @@ AzureBlobContextState::GetBlobContainerClient(const std::string &blobContainerNa
 }
 
 //////// AzureBlobStorageFileHandle ////////
+static ErrorData StagingError(const IOException &error) {
+	return ErrorData(error, std::make_exception_ptr(error));
+}
+
+class AzureStageBlockTask : public Task {
+public:
+	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, BufferHandle data_p, idx_t size_p)
+	    : handle(handle_p), block_id(std::move(block_id_p)), data(std::move(data_p)), size(size_p) {
+	}
+
+	~AzureStageBlockTask() override {
+		if (!ran) {
+			handle.FinishStaging(
+			    StagingError(IOException("a block of '%s' was dropped before it was staged", handle.path)));
+		}
+	}
+
+	TaskExecutionResult Execute(TaskExecutionMode mode) override {
+		ran = true;
+		handle.StageBlock(block_id, data.Ptr(), size);
+		data.Destroy();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "AzureStageBlockTask";
+	}
+
+private:
+	AzureBlobStorageFileHandle &handle;
+	string block_id;
+	BufferHandle data;
+	idx_t size;
+	bool ran = false;
+};
+
+//! The queue of the blocks staged on the async threads: an object of the database, which goes before its scheduler
+class AzureUploadProducer : public ObjectCacheEntry {
+public:
+	explicit AzureUploadProducer(TaskScheduler &scheduler) : token(scheduler.CreateProducer()) {
+	}
+
+	static string ObjectType() {
+		return "azure_upload_producer";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+
+	const unique_ptr<ProducerToken> token;
+};
+
+static ProducerToken &UploadProducer(DatabaseInstance &db) {
+	auto producer = db.GetObjectCache().GetOrCreate<AzureUploadProducer>(AzureUploadProducer::ObjectType(),
+	                                                                     TaskScheduler::GetScheduler(db));
+	return *producer->token;
+}
+
 AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info,
                                                        FileOpenFlags flags, const AzureOptions &opts,
-                                                       Azure::Storage::Blobs::BlockBlobClient blob_client)
-    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), blob_client(std::move(blob_client)) {
+                                                       Azure::Storage::Blobs::BlockBlobClient blob_client_p,
+                                                       optional_ptr<DatabaseInstance> db_p)
+    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), db(db_p),
+      blob_client(make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(blob_client_p))) {
+}
+
+shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> AzureBlobStorageFileHandle::BlobClient() {
+	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
+	return blob_client;
+}
+
+void AzureBlobStorageFileHandle::SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client) {
+	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
+	blob_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
+}
+
+AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
+	AwaitStagingNoThrow();
+}
+
+void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept {
+	ErrorData error;
+	try {
+		auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
+		BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(), staging_context);
+	} catch (const Azure::Storage::StorageException &e) {
+		error = StagingError(
+		    IOException("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s", path,
+		                e.ErrorCode, e.ReasonPhrase));
+	} catch (const Exception &e) {
+		error = ErrorData(e);
+	} catch (const std::exception &e) {
+		error =
+		    StagingError(IOException("AzureBlobStorageFileSystem staging a block of '%s' failed: %s", path, e.what()));
+	}
+	FinishStaging(std::move(error));
+}
+
+void AzureBlobStorageFileHandle::FinishStaging(ErrorData error) noexcept {
+	annotated_lock_guard<annotated_mutex> guard(staging_lock);
+	if (error.HasError() && !staging_error.HasError()) {
+		staging_error = std::move(error);
+	}
+	D_ASSERT(blocks_in_flight > 0);
+	blocks_in_flight--;
+}
+
+void AzureBlobStorageFileHandle::AwaitStaging(idx_t limit) {
+	ErrorData error;
+	{
+		annotated_unique_lock<annotated_mutex> guard(staging_lock);
+		auto ready = [&]() DUCKDB_NO_THREAD_SAFETY_ANALYSIS {
+			return blocks_in_flight <= limit;
+		};
+		if (!ready()) {
+			TaskScheduler::BlockingScope blocking;
+			staging_lock.Await(absl::Condition(&ready));
+		}
+		if (staging_error.HasError()) {
+			error = staging_error;
+		}
+	}
+	if (error.HasError()) {
+		error.Throw();
+	}
+}
+
+void AzureBlobStorageFileHandle::AwaitStagingNoThrow() noexcept {
+	annotated_unique_lock<annotated_mutex> guard(staging_lock);
+	auto idle = [&]() DUCKDB_NO_THREAD_SAFETY_ANALYSIS {
+		return blocks_in_flight == 0;
+	};
+	if (!idle()) {
+		TaskScheduler::BlockingScope blocking;
+		staging_lock.Await(absl::Condition(&idle));
+	}
 }
 
 void AzureBlobStorageFileHandle::StageWriteBuffer() {
@@ -84,18 +285,34 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 		return;
 	}
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
-	auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.get(), write_buffer_offset);
-	blob_client.StageBlock(block_id, body_stream); // throws on error
-	staged_block_count++;
+	const auto size = write_buffer_offset;
 	write_buffer_offset = 0;
+	if (!db || options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
+		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.Ptr(), size);
+		BlobClient()->StageBlock(block_id, body_stream); // throws on error
+		staged_block_count++;
+		return;
+	}
+	AwaitStaging(options.write_blocks_in_flight - 1);
+	{
+		annotated_lock_guard<annotated_mutex> guard(staging_lock);
+		blocks_in_flight++;
+	}
+	staged_block_count++;
+	auto task = make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::move(write_buffer), size);
+	TaskScheduler::GetScheduler(*db).ScheduleTask(UploadProducer(*db), std::move(task), TaskSchedulerType::ASYNC);
 }
 
 void AzureBlobStorageFileHandle::Sync() {
 	if (!(flags.OpenForWriting() || flags.OpenForAppending())) {
 		return;
 	}
+	if (aborted) {
+		throw IOException("Cannot sync '%s': its write was aborted", path);
+	}
 	try {
 		StageWriteBuffer();
+		AwaitStaging(0);
 		if (staged_block_count == 0) {
 			return;
 		}
@@ -105,8 +322,9 @@ void AzureBlobStorageFileHandle::Sync() {
 		for (uint32_t i = 0; i < total; i++) {
 			all_ids.push_back(MakeBlockId(i));
 		}
-		auto res = blob_client.CommitBlockList(all_ids);
+		auto res = BlobClient()->CommitBlockList(all_ids);
 		last_modified = AzureBlobStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureBlobStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {
@@ -116,8 +334,22 @@ void AzureBlobStorageFileHandle::Sync() {
 }
 
 void AzureBlobStorageFileHandle::Close() {
+	if (aborted) {
+		return;
+	}
 	Sync();
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void AzureBlobStorageFileHandle::Abort() {
+	if (aborted) {
+		return;
+	}
+	aborted = true;
+	staging_context.Cancel();
+	AwaitStagingNoThrow();
+	write_buffer.Destroy();
+	write_buffer_offset = 0;
 }
 
 //////// AzureBlobStorageFileSystem ////////
@@ -141,8 +373,8 @@ unique_ptr<AzureFileHandle> AzureBlobStorageFileSystem::CreateHandle(const OpenF
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(parsed_url.container);
 	auto blob_client = container.GetBlockBlobClient(parsed_url.path);
 
-	auto handle =
-	    make_uniq<AzureBlobStorageFileHandle>(*this, info, flags, storage_context->options, std::move(blob_client));
+	auto handle = make_uniq<AzureBlobStorageFileHandle>(*this, info, flags, storage_context->options,
+	                                                    std::move(blob_client), FileOpener::TryGetDatabase(opener));
 	if (!handle->PostConstruct()) {
 		return nullptr;
 	}
@@ -228,7 +460,6 @@ vector<OpenFileInfo> AzureBlobStorageFileSystem::Glob(const string &path, FileOp
 	return result;
 }
 
-// Caller beware -- this is always recursive, performance may be terrible.
 bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
                                                    const std::function<void(OpenFileInfo &info)> &callback,
                                                    optional_ptr<FileOpener> opener) {
@@ -241,53 +472,46 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 	auto storage_context = GetOrCreateStorageContext(opener, path, url);
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 
-	// NOTE: this code fakes dir listings by keeping a small cache of seen directories. Since blob store has no such
-	// concept, it's up to us to track and release them in the result. This plays a role in overwrite detection, so
-	// we do the work here.
-	set<string> seen_dirs;
-
 	bool rv = false;
-	const Azure::Storage::Blobs::ListBlobsOptions options = {/* .Prefix = */ url.path};
 	// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 	// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 	// (struct BlobItemDetails) and
 	// https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs
-	for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
+	Azure::Storage::Blobs::ListBlobsOptions list_options;
+	list_options.Prefix = url.path;
+	for (auto page = container.ListBlobsByHierarchy("/", list_options); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &blob : page.Blobs) {
-			// blob list returns _full paths_, so chop off the prefix first
-			auto child = blob.Name.substr(url.path.size());
-			// file case
-			auto slash_pos = child.find('/');
-			if (slash_pos == string::npos) {
-				rv = true;
-				OpenFileInfo info(child);
-				info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-				auto &options = info.extended_info->options;
-				options.emplace("type", Value("file"));
-				options.emplace("file_size", Value::BIGINT(blob.BlobSize));
-				options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-				auto etag = StripETagQuotes(blob.Details.ETag.ToString());
-				if (!etag.empty()) {
-					options.emplace("etag", Value(std::move(etag)));
-				}
-				callback(info);
-			} else {
-				// chop off slash + tail, take the remainder and treat as directory, caching it in seen to avoid repeat.
-				auto dir = child.substr(0, slash_pos);
-				if (seen_dirs.find(dir) == seen_dirs.end()) {
-					rv = true;
-					seen_dirs.insert(dir);
-					OpenFileInfo info(dir);
-					info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-					auto &options = info.extended_info->options;
-					options.emplace("type", Value("directory"));
-					options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(blob.Details.LastModified)));
-					callback(info);
-				}
+			rv = ListBlob(blob, url.path.size(), callback) || rv;
+		}
+		for (auto &prefix : page.BlobPrefixes) {
+			OpenFileInfo info(prefix.substr(url.path.size()));
+			StringUtil::RTrim(info.path, "/");
+			if (info.path.empty()) {
+				continue;
 			}
+			rv = true;
+			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+			info.extended_info->options.emplace("type", Value("directory"));
+			callback(info);
 		}
 	}
 	return rv;
+}
+
+void AzureBlobStorageFileSystem::ListFilesRecursive(const string &directory,
+                                                    const std::function<void(OpenFileInfo &info)> &callback,
+                                                    optional_ptr<FileOpener> opener) {
+	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	auto url = ParseUrl(prefix);
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	try {
+		ForEachBlob(container, url.path,
+		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { ListBlob(blob, url.path.size(), callback); });
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
 }
 
 void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
@@ -314,17 +538,21 @@ void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	};
 
 	auto create_file = [&]() {
-		auto res_create = afh.blob_client.CommitBlockList({});
+		Azure::Storage::Blobs::CommitBlockListOptions options;
+		if (afh.flags.ExclusiveCreate()) {
+			options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
+		}
+		auto res_create = afh.BlobClient()->CommitBlockList({}, options);
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
 
+	if (afh.flags.ExclusiveCreate()) {
+		return create_file();
+	}
 	try {
-		auto res_props = afh.blob_client.GetProperties();
-		if (afh.flags.ExclusiveCreate()) {
-			throw IOException("AzureBlobStorageFileSystem will not open file: '%s', ExclusiveCreate specified "
-			                  "while file already exists.");
-		} else if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
+		auto res_props = afh.BlobClient()->GetProperties();
+		if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
 			return truncate_file();
 		}
 		// NOTE: honor convention for S3/Azure "foo/" empty file -> "foo" dir marker
@@ -412,6 +640,81 @@ bool AzureBlobStorageFileSystem::TryRemoveFile(const string &filename, optional_
 	return blob_client.DeleteIfExists().Value.Deleted;
 }
 
+void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener) {
+	struct ContainerBlobs {
+		//! The file the storage context of the container is resolved for
+		const string &filename;
+		AzureParsedUrl url;
+		vector<string> names;
+	};
+	unordered_map<string, ContainerBlobs> containers;
+	for (auto &filename : filenames) {
+		auto url = ParseUrl(filename);
+		string key;
+		if (!url.is_fully_qualified) {
+			auto secret = LookupSecret(opener, filename);
+			if (secret.HasMatch()) {
+				key = secret.GetSecret().GetName().GetIdentifierName();
+			}
+		}
+		key += '/' + url.storage_account_name + '.' + url.endpoint + '/' + url.container;
+		auto entry = containers.try_emplace(std::move(key), filename, url).first;
+		entry->second.names.push_back(url.path);
+	}
+	for (auto &entry : containers) {
+		auto &blobs = entry.second;
+		auto storage_context = GetOrCreateStorageContext(opener, blobs.filename, blobs.url);
+		DeleteBlobs(storage_context->As<AzureBlobContextState>().GetBlobContainerClient(blobs.url.container),
+		            blobs.names);
+	}
+}
+
+void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	vector<string> names;
+	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	auto url = ParseUrl(prefix);
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	try {
+		ForEachBlob(container, url.path,
+		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { names.push_back(std::move(blob.Name)); });
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
+	DeleteBlobs(container, names);
+}
+
+void AzureBlobStorageFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
+	if (source == target) {
+		return;
+	}
+	auto source_url = ParseUrl(source);
+	auto target_url = ParseUrl(target);
+	auto source_context = GetOrCreateStorageContext(opener, source, source_url);
+	auto target_context = GetOrCreateStorageContext(opener, target, target_url);
+	auto source_blob = source_context->As<AzureBlobContextState>()
+	                       .GetBlobContainerClient(source_url.container)
+	                       .GetBlockBlobClient(source_url.path);
+	auto target_blob = target_context->As<AzureBlobContextState>()
+	                       .GetBlobContainerClient(target_url.container)
+	                       .GetBlockBlobClient(target_url.path);
+	try {
+		auto copy = target_blob.StartCopyFromUri(source_blob.GetUrl());
+		auto &headers = copy.GetRawResponse().GetHeaders();
+		auto copy_status = headers.find("x-ms-copy-status");
+		if (copy_status == headers.end() || copy_status->second != "success") {
+			copy.PollUntilDone(std::chrono::milliseconds(50));
+		}
+		source_blob.Delete();
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem move of '%s' to '%s' failed with %s Reason Phrase: %s", source,
+		                  target, e.ErrorCode, e.ReasonPhrase);
+	} catch (const Azure::Core::RequestFailedException &e) {
+		throw IOException("AzureBlobStorageFileSystem move of '%s' to '%s' failed: %s", source, target, e.what());
+	}
+}
+
 void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
                                            idx_t buffer_out_len) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
@@ -422,26 +725,49 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 	// Transport failures are retried below (duckdb retry + SDK RetryPolicy);
 	// a delivered-but-short body is deterministic, so it fails immediately.
 	idx_t total_read = 0;
-	try {
-		Azure::Core::Http::HttpRange range;
-		range.Offset = (int64_t)file_offset;
-		range.Length = (int64_t)buffer_out_len;
-		Azure::Storage::Blobs::DownloadBlobOptions options;
-		options.Range = range;
-		auto res = afh.blob_client.Download(options);
-		auto &stream = *res.Value.BodyStream;
-		while (total_read < buffer_out_len) {
-			auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
-			if (read_now == 0) {
-				break;
+	for (bool reconnected = false;; reconnected = true) {
+		try {
+			Azure::Core::Http::HttpRange range;
+			range.Offset = (int64_t)file_offset;
+			range.Length = (int64_t)buffer_out_len;
+			Azure::Storage::Blobs::DownloadBlobOptions options;
+			options.Range = range;
+			if (!afh.etag.empty()) {
+				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			total_read += read_now;
+			auto res = afh.BlobClient()->Download(options);
+			auto &stream = *res.Value.BodyStream;
+			while (total_read < buffer_out_len) {
+				auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
+				if (read_now == 0) {
+					break;
+				}
+				total_read += read_now;
+			}
+			break;
+		} catch (const Azure::Storage::StorageException &e) {
+			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
+				throw IOException(
+				    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
+				    "ETag is no longer %s",
+				    afh.path, afh.etag);
+			}
+			// A secret replaced since the handle opened, for one whose credentials expired, signs the retry
+			if (!reconnected && e.StatusCode == Azure::Core::Http::HttpStatusCode::Forbidden && afh.Database()) {
+				DatabaseFileOpener opener(*afh.Database());
+				auto parsed_url = ParseUrl(afh.path);
+				auto context = GetOrCreateStorageContext(&opener, afh.path, parsed_url);
+				afh.SetBlobClient(context->As<AzureBlobContextState>()
+				                      .GetBlobContainerClient(parsed_url.container)
+				                      .GetBlockBlobClient(parsed_url.path));
+				total_read = 0;
+				continue;
+			}
+			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
+			                  e.ErrorCode, e.ReasonPhrase);
+		} catch (const Azure::Core::RequestFailedException &e) {
+			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 		}
-	} catch (const Azure::Storage::StorageException &e) {
-		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
-		                  e.ErrorCode, e.ReasonPhrase);
-	} catch (const Azure::Core::RequestFailedException &e) {
-		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 	}
 	if (total_read < buffer_out_len) {
 		throw IOException("AzureBlobStorageFileSystem Read to '%s' returned %llu of %llu requested bytes", afh.path,
@@ -473,6 +799,9 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
 	}
+	if (afh.Aborted()) {
+		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
+	}
 
 	D_ASSERT(location == afh.file_offset);
 
@@ -481,12 +810,13 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 	idx_t remaining = static_cast<idx_t>(nr_bytes);
 
 	while (remaining > 0) {
-		if (!afh.write_buffer) {
-			afh.write_buffer = duckdb::unique_ptr<data_t[]>(new data_t[block_size]);
+		if (!afh.write_buffer.IsValid()) {
+			afh.write_buffer =
+			    BufferManager::GetBufferManager(*afh.Database()).Allocate(MemoryTag::EXTENSION, block_size);
 		}
 		idx_t space = block_size - afh.write_buffer_offset;
 		idx_t to_copy = MinValue<idx_t>(space, remaining);
-		memcpy(afh.write_buffer.get() + afh.write_buffer_offset, src, to_copy);
+		memcpy(afh.write_buffer.GetDataMutable() + afh.write_buffer_offset, src, to_copy);
 		afh.write_buffer_offset += to_copy;
 		src += to_copy;
 		remaining -= to_copy;
@@ -508,6 +838,10 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 void AzureBlobStorageFileSystem::FileSync(FileHandle &handle) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
 	afh.Sync();
+}
+
+void AzureBlobStorageFileSystem::AbortFileWrite(FileHandle &handle) {
+	handle.Cast<AzureBlobStorageFileHandle>().Abort();
 }
 
 } // namespace duckdb

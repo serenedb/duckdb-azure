@@ -23,6 +23,7 @@ struct AzureOptions {
 	idx_t read_buffer_size = (idx_t)8 * 1024 * 1024;
 	idx_t write_block_size = WRITE_BLOCK_SIZE_DEFAULT;
 	idx_t write_staged_blocks_per_commit = 0;
+	idx_t write_blocks_in_flight = 20;
 };
 
 class AzureContextState : public ClientContextState {

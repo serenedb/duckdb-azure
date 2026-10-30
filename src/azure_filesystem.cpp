@@ -71,11 +71,12 @@ bool AzureFileHandle::PostConstruct() {
 bool AzureStorageFileSystem::LoadFileInfo(AzureFileHandle &handle) {
 	try {
 		LoadRemoteFileInfo(handle);
-		if (handle.flags.ReturnNullIfExists()) {
-			return false;
-		}
 	} catch (const Azure::Storage::StorageException &e) {
 		if (int(e.StatusCode) == 404 && handle.flags.ReturnNullIfNotExists()) {
+			return false;
+		}
+		if ((e.ErrorCode == "BlobAlreadyExists" || e.ErrorCode == "PathAlreadyExists") &&
+		    handle.flags.ReturnNullIfExists()) {
 			return false;
 		}
 		throw IOException(
@@ -296,6 +297,11 @@ AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> 
 	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_staged_blocks_per_commit",
 	                                     write_staged_blocks_per_commit_val)) {
 		options.write_staged_blocks_per_commit = write_staged_blocks_per_commit_val.GetValue<idx_t>();
+	}
+
+	Value write_blocks_in_flight_val;
+	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_blocks_in_flight", write_blocks_in_flight_val)) {
+		options.write_blocks_in_flight = write_blocks_in_flight_val.GetValue<idx_t>();
 	}
 
 	return options;

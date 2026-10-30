@@ -35,6 +35,24 @@ inline static bool IsDfsScheme(const string &fpath) {
 	       fpath.rfind(AzureDfsStorageFileSystem::UNSECURE_PATH_PREFIX, 0) == 0;
 }
 
+static OpenFileInfo ListedPath(const Azure::Storage::Files::DataLake::Models::PathItem &child, idx_t strip_length) {
+	// Strangely, the DataLake API returns whole path, where the Blob API (correctly?)
+	// only returns the child name without prefix.
+	OpenFileInfo info(child.Name.substr(strip_length));
+	info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+	auto &options = info.extended_info->options;
+	options.emplace("type", Value(child.IsDirectory ? "directory" : "file"));
+	options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(child.FileSize)));
+	options.emplace("last_modified", Value::TIMESTAMP(AzureStorageFileSystem::ToTimestamp(child.LastModified)));
+	if (!child.IsDirectory) {
+		auto etag = AzureStorageFileSystem::StripETagQuotes(child.ETag);
+		if (!etag.empty()) {
+			options.emplace("etag", Value(std::move(etag)));
+		}
+	}
+	return info;
+}
+
 static void Walk(const Azure::Storage::Files::DataLake::DataLakeFileSystemClient &fs, const std::string &path,
                  const string &path_pattern, std::size_t end_match, std::vector<OpenFileInfo> *out_result) {
 	auto directory_client = fs.GetDirectoryClient(path);
@@ -126,6 +144,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 	if (!(flags.OpenForWriting() || flags.OpenForAppending())) {
 		return;
 	}
+	if (aborted) {
+		throw IOException("Cannot sync '%s': its write was aborted", path);
+	}
 	try {
 		StageWriteBuffer();
 		if (staged_block_count == 0 && !close) {
@@ -133,7 +154,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 		}
 		Azure::Storage::Files::DataLake::FlushFileOptions flush_opts;
 		flush_opts.Close = close;
-		file_client.Flush(staged_offset, flush_opts);
+		auto res = file_client.Flush(staged_offset, flush_opts);
+		last_modified = AzureStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {
@@ -143,8 +166,17 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 }
 
 void AzureDfsStorageFileHandle::Close() {
+	if (aborted) {
+		return;
+	}
 	Sync(true);
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void AzureDfsStorageFileHandle::Abort() {
+	aborted = true;
+	write_buffer.reset();
+	write_buffer_offset = 0;
 }
 
 //////// AzureDfsStorageFileSystem ////////
@@ -305,30 +337,34 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 	for (auto page = dir_client.ListPaths(false); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &child : page.Paths) {
 			rv = true;
-			// Strangely, the DataLake API returns whole path, where the Blob API (correctly?)
-			// only returns the child name without prefix.
-			OpenFileInfo info(child.Name.substr(child_strip_len));
-			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-			auto &options = info.extended_info->options;
-			Value file_type(child.IsDirectory ? "directory" : "file");
-			options.emplace("type", std::move(file_type));
-			options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(child.FileSize)));
-			options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(child.LastModified)));
-			if (!child.IsDirectory) {
-				auto etag = StripETagQuotes(child.ETag);
-				if (!etag.empty()) {
-					options.emplace("etag", Value(std::move(etag)));
-				}
-			}
-
 			// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 			// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 			// (struct BlobItemDetails) and
 			// https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs
+			auto info = ListedPath(child, child_strip_len);
 			callback(info);
 		}
 	}
 	return rv;
+}
+
+void AzureDfsStorageFileSystem::ListFilesRecursive(const string &directory,
+                                                   const std::function<void(OpenFileInfo &info)> &callback,
+                                                   optional_ptr<FileOpener> opener) {
+	auto url = ParseUrl(directory);
+	auto storage_context = GetOrCreateStorageContext(opener, directory, url);
+	auto fs = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(url.container);
+	auto dir_client = fs.GetDirectoryClient(url.path);
+	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
+	for (auto page = dir_client.ListPaths(true); page.HasPage(); page.MoveToNextPage()) {
+		for (auto &child : page.Paths) {
+			if (child.IsDirectory) {
+				continue;
+			}
+			auto info = ListedPath(child, child_strip_len);
+			callback(info);
+		}
+	}
 }
 
 void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
@@ -355,17 +391,21 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	};
 
 	auto create_file = [&]() {
-		auto res_create = afh.file_client.Create();
+		Azure::Storage::Files::DataLake::CreateFileOptions options;
+		if (afh.flags.ExclusiveCreate()) {
+			options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
+		}
+		auto res_create = afh.file_client.Create(options);
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
 
+	if (afh.flags.ExclusiveCreate()) {
+		return create_file();
+	}
 	try {
 		auto res_props = afh.file_client.GetProperties();
-		if (afh.flags.ExclusiveCreate()) {
-			throw IOException("AzureDfsStorageFileSystem will not open file: '%s', ExclusiveCreate specified "
-			                  "while file already exists.");
-		} else if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
+		if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
 			return truncate_file();
 		}
 		// NOTE: honor convention for S3/Azure "foo/" empty file -> "foo" dir marker
@@ -442,6 +482,9 @@ void AzureDfsStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
 	}
+	if (afh.aborted) {
+		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
+	}
 
 	if (location != afh.file_offset || location != afh.length) {
 		throw InternalException("Write supported only sequentially or at location=0");
@@ -479,6 +522,10 @@ void AzureDfsStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 void AzureDfsStorageFileSystem::FileSync(FileHandle &handle) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
 	afh.Sync();
+}
+
+void AzureDfsStorageFileSystem::AbortFileWrite(FileHandle &handle) {
+	handle.Cast<AzureDfsStorageFileHandle>().Abort();
 }
 
 } // namespace duckdb
