@@ -71,11 +71,12 @@ bool AzureFileHandle::PostConstruct() {
 bool AzureStorageFileSystem::LoadFileInfo(AzureFileHandle &handle) {
 	try {
 		LoadRemoteFileInfo(handle);
-		if (handle.flags.ReturnNullIfExists()) {
-			return false;
-		}
 	} catch (const Azure::Storage::StorageException &e) {
 		if (int(e.StatusCode) == 404 && handle.flags.ReturnNullIfNotExists()) {
+			return false;
+		}
+		if ((e.ErrorCode == "BlobAlreadyExists" || e.ErrorCode == "PathAlreadyExists") &&
+		    handle.flags.ReturnNullIfExists()) {
 			return false;
 		}
 		throw IOException(

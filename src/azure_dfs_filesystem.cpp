@@ -391,17 +391,21 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	};
 
 	auto create_file = [&]() {
-		auto res_create = afh.file_client.Create();
+		Azure::Storage::Files::DataLake::CreateFileOptions options;
+		if (afh.flags.ExclusiveCreate()) {
+			options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
+		}
+		auto res_create = afh.file_client.Create(options);
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
 
+	if (afh.flags.ExclusiveCreate()) {
+		return create_file();
+	}
 	try {
 		auto res_props = afh.file_client.GetProperties();
-		if (afh.flags.ExclusiveCreate()) {
-			throw IOException("AzureDfsStorageFileSystem will not open file: '%s', ExclusiveCreate specified "
-			                  "while file already exists.");
-		} else if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
+		if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
 			return truncate_file();
 		}
 		// NOTE: honor convention for S3/Azure "foo/" empty file -> "foo" dir marker
