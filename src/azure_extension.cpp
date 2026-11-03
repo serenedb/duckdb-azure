@@ -79,6 +79,14 @@ std::string AzureExtension::Name() {
 	return "azure";
 }
 
+std::string AzureExtension::Version() const {
+#ifdef EXT_VERSION_AZURE
+	return EXT_VERSION_AZURE;
+#else
+	return "";
+#endif
+}
+
 } // namespace duckdb
 
 extern "C" {
