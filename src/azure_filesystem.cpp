@@ -146,7 +146,8 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 			return;
 		}
-		ReadRange(hfh, location, (char *)buffer, to_read);
+		const FileReadTarget target {data_ptr_cast(buffer), to_read};
+		ReadRange(hfh, location, std::span(&target, 1));
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
@@ -180,13 +181,15 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 
 			// Bypass buffer if we read more than buffer size
 			if (to_read > new_buffer_available) {
-				ReadRange(hfh, location + buffer_offset, (char *)buffer + buffer_offset, to_read);
+				const FileReadTarget target {data_ptr_cast(buffer) + buffer_offset, to_read};
+				ReadRange(hfh, location + buffer_offset, std::span(&target, 1));
 				hfh.buffer_available = 0;
 				hfh.buffer_idx = 0;
 				hfh.file_offset += to_read;
 				break;
 			} else {
-				ReadRange(hfh, hfh.file_offset, (char *)hfh.read_buffer.get(), new_buffer_available);
+				const FileReadTarget target {data_ptr_cast(hfh.read_buffer.get()), new_buffer_available};
+				ReadRange(hfh, hfh.file_offset, std::span(&target, 1));
 				hfh.buffer_available = new_buffer_available;
 				hfh.buffer_idx = 0;
 				hfh.buffer_start = hfh.file_offset;
@@ -195,6 +198,33 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 		}
 	}
 	DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
+}
+
+void AzureStorageFileSystem::ReadScattered(FileHandle &handle, std::span<const FileReadTarget> targets,
+                                           idx_t location) {
+	const auto size = FileReadTarget::TotalSize(targets);
+	if (size != 0) {
+		ReadRange(handle.Cast<AzureFileHandle>(), location, targets);
+	}
+	DUCKDB_LOG_FILE_SYSTEM_READ(handle, size, location);
+}
+
+idx_t AzureStorageFileSystem::ReadBody(Azure::Core::IO::BodyStream &body, std::span<const FileReadTarget> targets) {
+	data_t skipped[4096];
+	idx_t total = 0;
+	for (auto &target : targets) {
+		for (idx_t offset = 0; offset < target.size;) {
+			const auto remaining = target.size - offset;
+			const auto read = target.data ? body.Read(target.data + offset, remaining)
+			                              : body.Read(skipped, MinValue<idx_t>(remaining, sizeof(skipped)));
+			if (read == 0) {
+				return total;
+			}
+			offset += read;
+			total += read;
+		}
+	}
+	return total;
 }
 
 int64_t AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {

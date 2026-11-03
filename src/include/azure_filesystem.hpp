@@ -9,6 +9,7 @@
 #include "duckdb/main/client_context_state.hpp"
 
 #include <azure/core/datetime.hpp>
+#include <azure/core/io/body_stream.hpp>
 #include <cstdint>
 #include <ctime>
 
@@ -100,6 +101,7 @@ public:
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	void ReadScattered(FileHandle &handle, std::span<const FileReadTarget> targets, idx_t location) override;
 	bool CanSeek() override {
 		return true;
 	}
@@ -131,7 +133,11 @@ protected:
 
 	virtual duckdb::unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                                         optional_ptr<FileOpener> opener) = 0;
-	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) = 0;
+	//! GETs exactly the bytes [targets] take at [file_offset], into them in order; a target without data skips its
+	//! bytes
+	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) = 0;
+	//! Reads [body] into [targets] in order, returning the bytes read before it ended
+	static idx_t ReadBody(Azure::Core::IO::BodyStream &body, std::span<const FileReadTarget> targets);
 
 	virtual const string &GetContextPrefix() const = 0;
 	shared_ptr<AzureContextState> GetOrCreateStorageContext(optional_ptr<FileOpener> opener, const string &path,

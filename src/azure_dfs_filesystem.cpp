@@ -421,9 +421,10 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	}
 }
 
-void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
-                                          idx_t buffer_out_len) {
+void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
+                                          std::span<const FileReadTarget> targets) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
+	const auto buffer_out_len = FileReadTarget::TotalSize(targets);
 	if (buffer_out_len == 0) {
 		return;
 	}
@@ -436,14 +437,7 @@ void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_of
 		Azure::Storage::Files::DataLake::DownloadFileOptions options;
 		options.Range = range;
 		auto res = afh.file_client.Download(options);
-		auto &stream = *res.Value.Body;
-		while (total_read < buffer_out_len) {
-			auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
-			if (read_now == 0) {
-				break;
-			}
-			total_read += read_now;
-		}
+		total_read = ReadBody(*res.Value.Body, targets);
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
 		                  "%s",
