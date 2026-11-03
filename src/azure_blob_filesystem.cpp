@@ -462,7 +462,7 @@ vector<OpenFileInfo> AzureBlobStorageFileSystem::Glob(const string &path, FileOp
 
 bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
                                                    const std::function<void(OpenFileInfo &info)> &callback,
-                                                   optional_ptr<FileOpener> opener) {
+                                                   optional_ptr<FileOpener> opener, const ListFilesOptions &options) {
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
@@ -473,6 +473,17 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
 
 	bool rv = false;
+	if (options.recursive) {
+		try {
+			ForEachBlob(container, url.path, [&](Azure::Storage::Blobs::Models::BlobItem &blob) {
+				rv = ListBlob(blob, url.path.size(), callback) || rv;
+			});
+		} catch (const Azure::Storage::StorageException &e) {
+			throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", path,
+			                  e.ErrorCode, e.ReasonPhrase);
+		}
+		return rv;
+	}
 	// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 	// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 	// (struct BlobItemDetails) and
@@ -496,22 +507,6 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 		}
 	}
 	return rv;
-}
-
-void AzureBlobStorageFileSystem::ListFilesRecursive(const string &directory,
-                                                    const std::function<void(OpenFileInfo &info)> &callback,
-                                                    optional_ptr<FileOpener> opener) {
-	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
-	auto url = ParseUrl(prefix);
-	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
-	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
-	try {
-		ForEachBlob(container, url.path,
-		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { ListBlob(blob, url.path.size(), callback); });
-	} catch (const Azure::Storage::StorageException &e) {
-		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
-		                  e.ErrorCode, e.ReasonPhrase);
-	}
 }
 
 void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {

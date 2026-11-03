@@ -76,9 +76,7 @@ class AzureBlobStorageFileSystem : public AzureStorageFileSystem {
 public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
-	                       optional_ptr<FileOpener> opener) override;
-	void ListFilesRecursive(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
-	                        optional_ptr<FileOpener> opener = nullptr) override;
+	                       optional_ptr<FileOpener> opener, const ListFilesOptions &options) override;
 
 	bool SupportsListFilesExtended() const override {
 		return true;

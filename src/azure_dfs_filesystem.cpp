@@ -322,7 +322,7 @@ vector<OpenFileInfo> AzureDfsStorageFileSystem::Glob(const string &path, FileOpe
 
 bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
                                                   const std::function<void(OpenFileInfo &info)> &callback,
-                                                  optional_ptr<FileOpener> opener) {
+                                                  optional_ptr<FileOpener> opener, const ListFilesOptions &options) {
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
@@ -334,8 +334,11 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 
 	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
 	bool rv = false;
-	for (auto page = dir_client.ListPaths(false); page.HasPage(); page.MoveToNextPage()) {
+	for (auto page = dir_client.ListPaths(options.recursive); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &child : page.Paths) {
+			if (options.recursive && child.IsDirectory) {
+				continue;
+			}
 			rv = true;
 			// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 			// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
@@ -346,25 +349,6 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 		}
 	}
 	return rv;
-}
-
-void AzureDfsStorageFileSystem::ListFilesRecursive(const string &directory,
-                                                   const std::function<void(OpenFileInfo &info)> &callback,
-                                                   optional_ptr<FileOpener> opener) {
-	auto url = ParseUrl(directory);
-	auto storage_context = GetOrCreateStorageContext(opener, directory, url);
-	auto fs = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(url.container);
-	auto dir_client = fs.GetDirectoryClient(url.path);
-	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
-	for (auto page = dir_client.ListPaths(true); page.HasPage(); page.MoveToNextPage()) {
-		for (auto &child : page.Paths) {
-			if (child.IsDirectory) {
-				continue;
-			}
-			auto info = ListedPath(child, child_strip_len);
-			callback(info);
-		}
-	}
 }
 
 void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
