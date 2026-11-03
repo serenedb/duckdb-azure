@@ -651,9 +651,10 @@ void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, option
 	DeleteBlobs(container, names);
 }
 
-void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
-                                           idx_t buffer_out_len) {
+void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
+                                           std::span<const FileReadTarget> targets) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
+	const auto buffer_out_len = FileReadTarget::TotalSize(targets);
 	if (buffer_out_len == 0) {
 		return;
 	}
@@ -672,14 +673,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
 			auto res = afh.BlobClient()->Download(options);
-			auto &stream = *res.Value.BodyStream;
-			while (total_read < buffer_out_len) {
-				auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
-				if (read_now == 0) {
-					break;
-				}
-				total_read += read_now;
-			}
+			total_read = ReadBody(*res.Value.BodyStream, targets);
 			break;
 		} catch (const Azure::Storage::StorageException &e) {
 			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
