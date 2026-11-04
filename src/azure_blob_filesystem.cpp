@@ -202,11 +202,16 @@ AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
 	AwaitStagingNoThrow();
 }
 
+void AzureBlobStorageFileHandle::PutBlock(const string &block_id, const_data_ptr_t data, idx_t size) {
+	auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
+	BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(),
+	                         staging_context.WithValue(AzureWriteBodyKey(), AzureWriteBody {data, size}));
+}
+
 void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept {
 	ErrorData error;
 	try {
-		auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
-		BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(), staging_context);
+		PutBlock(block_id, data, size);
 	} catch (const Azure::Storage::StorageException &e) {
 		error = StagingError(
 		    IOException("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s", path,
@@ -266,8 +271,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	}
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
 	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
-		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.Ptr(), write_buffer_offset);
-		BlobClient()->StageBlock(block_id, body_stream); // throws on error
+		PutBlock(block_id, write_buffer.Ptr(), write_buffer_offset);
 		staged_block_count++;
 		write_buffer_offset = 0;
 		return;

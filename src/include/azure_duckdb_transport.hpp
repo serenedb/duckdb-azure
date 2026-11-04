@@ -6,19 +6,19 @@
 #include <azure/core/context.hpp>
 #include <azure/core/http/transport.hpp>
 #include <memory>
-#include <span>
 #include <string>
 
 namespace duckdb {
 
 class FileOpener;
 
-struct AzureReadTargets {
-	std::span<const FileReadTarget> targets;
-	idx_t delivered = 0;
+struct AzureWriteBody {
+	const_data_ptr_t data = nullptr;
+	idx_t size = 0;
 };
 
 const Azure::Core::Context::Key &AzureReadTargetsKey();
+const Azure::Core::Context::Key &AzureWriteBodyKey();
 
 // HttpTransport backed by DuckDB's HTTPUtil (the httpfs curl client and its
 // connection cache when httpfs is loaded), replacing the Azure SDK's own
