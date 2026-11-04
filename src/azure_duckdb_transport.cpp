@@ -159,8 +159,12 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
 	} else if (method == HttpMethod::Put) {
-		body_in = DrainRequestBody(request, context);
-		PutRequestInfo info(url, headers, *params, body_in.data(), body_in.size(), content_type);
+		AzureWriteBody body;
+		if (!context.TryGetValue(AzureWriteBodyKey(), body)) {
+			body_in = DrainRequestBody(request, context);
+			body = {body_in.data(), body_in.size()};
+		}
+		PutRequestInfo info(url, headers, *params, body.data, body.size, content_type);
 		response = run(info);
 	} else if (method == HttpMethod::Post) {
 		body_in = DrainRequestBody(request, context);
@@ -207,6 +211,11 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 } // namespace
 
 const Azure::Core::Context::Key &AzureReadTargetsKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
+
+const Azure::Core::Context::Key &AzureWriteBodyKey() {
 	static const Azure::Core::Context::Key key;
 	return key;
 }
