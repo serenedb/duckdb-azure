@@ -112,7 +112,49 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	std::string body_out;
 	std::vector<uint8_t> body_in;
 
-	if (method == HttpMethod::Get) {
+	AzureReadTargets *sink = nullptr;
+	if (method == HttpMethod::Get && context.TryGetValue(AzureReadTargetsKey(), sink)) {
+		const auto capacity = FileReadTarget::TotalSize(sink->targets);
+		bool into_targets = false;
+		idx_t target_index = 0;
+		idx_t target_offset = 0;
+		GetRequestInfo info(
+		    url, headers, *params,
+		    [&](const HTTPResponse &response) {
+			    const auto status = static_cast<int>(response.status);
+			    into_targets = status >= 200 && status < 300;
+			    sink->delivered = 0;
+			    target_index = 0;
+			    target_offset = 0;
+			    return !context.IsCancelled();
+		    },
+		    [&](const_data_ptr_t data, idx_t length) {
+			    if (!into_targets) {
+				    body_out.append(const_char_ptr_cast(data), length);
+				    return !context.IsCancelled();
+			    }
+			    if (length > capacity - sink->delivered) {
+				    throw TransportException("request to '" + url + "' returned more bytes than it asked for");
+			    }
+			    sink->delivered += length;
+			    while (length > 0) {
+				    auto &target = sink->targets[target_index];
+				    const auto chunk = MinValue(length, target.size - target_offset);
+				    if (target.data) {
+					    std::memcpy(target.data + target_offset, data, chunk);
+				    }
+				    data += chunk;
+				    length -= chunk;
+				    target_offset += chunk;
+				    if (target_offset == target.size) {
+					    target_index++;
+					    target_offset = 0;
+				    }
+			    }
+			    return !context.IsCancelled();
+		    });
+		response = run(info);
+	} else if (method == HttpMethod::Get) {
 		GetRequestInfo info(
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
@@ -163,6 +205,11 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 }
 
 } // namespace
+
+const Azure::Core::Context::Key &AzureReadTargetsKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
 
 std::shared_ptr<Azure::Core::Http::HttpTransport> CreateDuckDBTransport(optional_ptr<FileOpener> opener,
                                                                         const std::string &proxy,

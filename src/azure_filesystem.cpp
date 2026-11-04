@@ -209,24 +209,6 @@ void AzureStorageFileSystem::ReadScattered(FileHandle &handle, std::span<const F
 	DUCKDB_LOG_FILE_SYSTEM_READ(handle, size, location);
 }
 
-idx_t AzureStorageFileSystem::ReadBody(Azure::Core::IO::BodyStream &body, std::span<const FileReadTarget> targets) {
-	data_t skipped[4096];
-	idx_t total = 0;
-	for (auto &target : targets) {
-		for (idx_t offset = 0; offset < target.size;) {
-			const auto remaining = target.size - offset;
-			const auto read = target.data ? body.Read(target.data + offset, remaining)
-			                              : body.Read(skipped, MinValue<idx_t>(remaining, sizeof(skipped)));
-			if (read == 0) {
-				return total;
-			}
-			offset += read;
-			total += read;
-		}
-	}
-	return total;
-}
-
 int64_t AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &hfh = handle.Cast<AzureFileHandle>();
 	idx_t max_read = hfh.length - hfh.file_offset;

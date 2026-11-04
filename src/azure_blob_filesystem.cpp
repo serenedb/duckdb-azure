@@ -1,5 +1,6 @@
 #include "azure_blob_filesystem.hpp"
 
+#include "azure_duckdb_transport.hpp"
 #include "azure_http_state.hpp"
 #include "azure_storage_account_client.hpp"
 #include "duckdb/common/exception.hpp"
@@ -731,8 +732,9 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			if (!afh.etag.empty()) {
 				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			auto res = afh.BlobClient()->Download(options);
-			total_read = ReadBody(*res.Value.BodyStream, targets);
+			AzureReadTargets sink {targets};
+			afh.BlobClient()->Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
+			total_read = sink.delivered;
 			break;
 		} catch (const Azure::Storage::StorageException &e) {
 			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {

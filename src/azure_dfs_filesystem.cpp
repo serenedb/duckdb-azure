@@ -1,5 +1,6 @@
 #include "azure_dfs_filesystem.hpp"
 
+#include "azure_duckdb_transport.hpp"
 #include "azure_storage_account_client.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -420,8 +421,9 @@ void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_of
 		range.Length = (int64_t)buffer_out_len;
 		Azure::Storage::Files::DataLake::DownloadFileOptions options;
 		options.Range = range;
-		auto res = afh.file_client.Download(options);
-		total_read = ReadBody(*res.Value.Body, targets);
+		AzureReadTargets sink {targets};
+		afh.file_client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
+		total_read = sink.delivered;
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
 		                  "%s",

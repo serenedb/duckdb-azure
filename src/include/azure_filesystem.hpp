@@ -9,7 +9,6 @@
 #include "duckdb/main/client_context_state.hpp"
 
 #include <azure/core/datetime.hpp>
-#include <azure/core/io/body_stream.hpp>
 #include <cstdint>
 #include <ctime>
 
@@ -136,8 +135,6 @@ protected:
 	//! GETs exactly the bytes [targets] take at [file_offset], into them in order; a target without data skips its
 	//! bytes
 	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) = 0;
-	//! Reads [body] into [targets] in order, returning the bytes read before it ended
-	static idx_t ReadBody(Azure::Core::IO::BodyStream &body, std::span<const FileReadTarget> targets);
 
 	virtual const string &GetContextPrefix() const = 0;
 	shared_ptr<AzureContextState> GetOrCreateStorageContext(optional_ptr<FileOpener> opener, const string &path,
