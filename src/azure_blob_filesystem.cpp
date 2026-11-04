@@ -1,5 +1,6 @@
 #include "azure_blob_filesystem.hpp"
 
+#include "azure_duckdb_transport.hpp"
 #include "azure_http_state.hpp"
 #include "azure_storage_account_client.hpp"
 #include "duckdb/common/exception.hpp"
@@ -654,14 +655,14 @@ void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, option
 void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
                                            std::span<const FileReadTarget> targets) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
-	const auto buffer_out_len = FileReadTarget::TotalSize(targets);
+	FileReadTargetWriter sink(targets);
+	const auto buffer_out_len = sink.Capacity();
 	if (buffer_out_len == 0) {
 		return;
 	}
 
 	// Transport failures are retried below (duckdb retry + SDK RetryPolicy);
 	// a delivered-but-short body is deterministic, so it fails immediately.
-	idx_t total_read = 0;
 	for (bool reconnected = false;; reconnected = true) {
 		try {
 			Azure::Core::Http::HttpRange range;
@@ -672,8 +673,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			if (!afh.etag.empty()) {
 				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 			}
-			auto res = afh.BlobClient()->Download(options);
-			total_read = ReadBody(*res.Value.BodyStream, targets);
+			afh.BlobClient()->Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
 			break;
 		} catch (const Azure::Storage::StorageException &e) {
 			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
@@ -698,9 +698,9 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 		}
 	}
-	if (total_read < buffer_out_len) {
+	if (sink.Written() < buffer_out_len) {
 		throw IOException("AzureBlobStorageFileSystem Read to '%s' returned %llu of %llu requested bytes", afh.path,
-		                  (uint64_t)total_read, (uint64_t)buffer_out_len);
+		                  (uint64_t)sink.Written(), (uint64_t)buffer_out_len);
 	}
 }
 
