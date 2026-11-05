@@ -747,14 +747,13 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 				    afh.path, afh.etag);
 			}
 			// A secret replaced since the handle opened, for one whose credentials expired, signs the retry
-			if (!reconnected && e.StatusCode == Azure::Core::Http::HttpStatusCode::Forbidden && afh.Database()) {
+			if (!reconnected && e.StatusCode == Azure::Core::Http::HttpStatusCode::Forbidden) {
 				DatabaseFileOpener opener(*afh.Database());
 				auto parsed_url = ParseUrl(afh.path);
 				auto context = GetOrCreateStorageContext(&opener, afh.path, parsed_url);
 				afh.SetBlobClient(context->As<AzureBlobContextState>()
 				                      .GetBlobContainerClient(parsed_url.container)
 				                      .GetBlockBlobClient(parsed_url.path));
-				total_read = 0;
 				continue;
 			}
 			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
