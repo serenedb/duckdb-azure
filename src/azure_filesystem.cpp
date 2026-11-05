@@ -68,6 +68,10 @@ bool AzureFileHandle::PostConstruct() {
 	return static_cast<AzureStorageFileSystem &>(file_system).LoadFileInfo(*this);
 }
 
+void AzureFileHandle::Abort() {
+	aborted = true;
+}
+
 bool AzureStorageFileSystem::LoadFileInfo(AzureFileHandle &handle) {
 	try {
 		LoadRemoteFileInfo(handle);
@@ -131,6 +135,10 @@ void AzureStorageFileSystem::Seek(FileHandle &handle, idx_t location) {
 idx_t AzureStorageFileSystem::SeekPosition(FileHandle &handle) {
 	auto &afh = handle.Cast<AzureFileHandle>();
 	return afh.file_offset;
+}
+
+void AzureStorageFileSystem::AbortFileWrite(FileHandle &handle) {
+	handle.Cast<AzureFileHandle>().Abort();
 }
 
 // TODO: this code is identical to HTTPFS, look into unifying it

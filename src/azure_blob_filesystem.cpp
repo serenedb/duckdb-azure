@@ -349,7 +349,7 @@ void AzureBlobStorageFileHandle::Abort() {
 	if (aborted) {
 		return;
 	}
-	aborted = true;
+	AzureFileHandle::Abort();
 	staging_context.Cancel();
 	AwaitStagingNoThrow();
 	write_buffer.Destroy();
@@ -792,7 +792,7 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
 	}
-	if (afh.Aborted()) {
+	if (afh.aborted) {
 		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
 	}
 
@@ -831,10 +831,6 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 void AzureBlobStorageFileSystem::FileSync(FileHandle &handle) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
 	afh.Sync();
-}
-
-void AzureBlobStorageFileSystem::AbortFileWrite(FileHandle &handle) {
-	handle.Cast<AzureBlobStorageFileHandle>().Abort();
 }
 
 } // namespace duckdb

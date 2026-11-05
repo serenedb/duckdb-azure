@@ -57,6 +57,7 @@ class AzureStorageFileSystem;
 class AzureFileHandle : public FileHandle {
 public:
 	virtual bool PostConstruct();
+	virtual void Abort();
 
 	bool IsRemoteLoaded() {
 		return is_remote_loaded;
@@ -72,6 +73,7 @@ protected:
 
 public:
 	FileOpenFlags flags;
+	bool aborted = false;
 
 	// File info
 	bool is_remote_loaded;
@@ -115,6 +117,7 @@ public:
 	string GetVersionTag(FileHandle &handle) override;
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
+	void AbortFileWrite(FileHandle &handle) override;
 
 	bool LoadFileInfo(AzureFileHandle &handle);
 
