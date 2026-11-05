@@ -69,14 +69,20 @@ static bool Match(vector<string>::const_iterator key, vector<string>::const_iter
 	return key == key_end && pattern == pattern_end;
 }
 
-static void ForEachBlob(const Azure::Storage::Blobs::BlobContainerClient &container, const string &prefix,
+static void ForEachBlob(const Azure::Storage::Blobs::BlobContainerClient &container, const string &path,
+                        const string &prefix,
                         const std::function<void(Azure::Storage::Blobs::Models::BlobItem &blob)> &callback) {
 	Azure::Storage::Blobs::ListBlobsOptions options;
 	options.Prefix = prefix;
-	for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
-		for (auto &blob : page.Blobs) {
-			callback(blob);
+	try {
+		for (auto page = container.ListBlobs(options); page.HasPage(); page.MoveToNextPage()) {
+			for (auto &blob : page.Blobs) {
+				callback(blob);
+			}
 		}
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", path,
+		                  e.ErrorCode, e.ReasonPhrase);
 	}
 }
 
@@ -478,14 +484,9 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 
 	bool rv = false;
 	if (options.recursive) {
-		try {
-			ForEachBlob(container, url.path, [&](Azure::Storage::Blobs::Models::BlobItem &blob) {
-				rv = ListBlob(blob, url.path.size(), callback) || rv;
-			});
-		} catch (const Azure::Storage::StorageException &e) {
-			throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", path,
-			                  e.ErrorCode, e.ReasonPhrase);
-		}
+		ForEachBlob(container, path, url.path, [&](Azure::Storage::Blobs::Models::BlobItem &blob) {
+			rv = ListBlob(blob, url.path.size(), callback) || rv;
+		});
 		return rv;
 	}
 	// NOTE: there's a LOT of metadata available, and tags, etc. -- see
@@ -674,13 +675,8 @@ void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, option
 	auto url = ParseUrl(prefix);
 	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
-	try {
-		ForEachBlob(container, url.path,
-		            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { names.push_back(std::move(blob.Name)); });
-	} catch (const Azure::Storage::StorageException &e) {
-		throw IOException("AzureBlobStorageFileSystem listing of '%s' failed with %s Reason Phrase: %s", prefix,
-		                  e.ErrorCode, e.ReasonPhrase);
-	}
+	ForEachBlob(container, prefix, url.path,
+	            [&](Azure::Storage::Blobs::Models::BlobItem &blob) { names.push_back(std::move(blob.Name)); });
 	DeleteBlobs(container, names);
 }
 
