@@ -56,6 +56,7 @@ public:
 	idx_t write_buffer_offset = 0;
 
 private:
+	void PutBlock(const string &block_id, const_data_ptr_t data, idx_t size, const Azure::Core::Context &context);
 	void AwaitStaging(idx_t limit);
 	void AwaitStagingNoThrow() noexcept;
 
