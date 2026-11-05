@@ -175,7 +175,7 @@ void AzureDfsStorageFileHandle::Close() {
 }
 
 void AzureDfsStorageFileHandle::Abort() {
-	aborted = true;
+	AzureFileHandle::Abort();
 	write_buffer.reset();
 	write_buffer_offset = 0;
 }
@@ -502,10 +502,6 @@ void AzureDfsStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 void AzureDfsStorageFileSystem::FileSync(FileHandle &handle) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
 	afh.Sync();
-}
-
-void AzureDfsStorageFileSystem::AbortFileWrite(FileHandle &handle) {
-	handle.Cast<AzureDfsStorageFileHandle>().Abort();
 }
 
 } // namespace duckdb

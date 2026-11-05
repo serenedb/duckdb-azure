@@ -34,11 +34,10 @@ public:
 	void StageWriteBuffer();
 	void Sync(bool close = false);
 	void Close() override;
-	void Abort();
+	void Abort() override;
 
 public:
 	Azure::Storage::Files::DataLake::DataLakeFileClient file_client;
-	bool aborted = false;
 	duckdb::unique_ptr<data_t[]> write_buffer;
 	idx_t write_buffer_offset = 0;
 	// Bytes sent to Append (staged on server, committed or not): always <= file_offset,
@@ -72,7 +71,6 @@ public:
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	void FileSync(FileHandle &handle) override;
-	void AbortFileWrite(FileHandle &handle) override;
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
