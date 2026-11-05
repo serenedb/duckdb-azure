@@ -289,7 +289,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
 	const auto size = write_buffer_offset;
 	write_buffer_offset = 0;
-	if (!db || options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
+	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
 		auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.Ptr(), size);
 		BlobClient()->StageBlock(
 		    block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(),
