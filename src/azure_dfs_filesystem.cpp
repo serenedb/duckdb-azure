@@ -404,21 +404,19 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
                                           std::span<const FileReadTarget> targets) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
-	const auto buffer_out_len = FileReadTarget::TotalSize(targets);
+	FileReadTargetWriter sink(targets);
+	const auto buffer_out_len = sink.Capacity();
 	if (buffer_out_len == 0) {
 		return;
 	}
 
-	idx_t total_read = 0;
 	try {
 		Azure::Core::Http::HttpRange range;
 		range.Offset = (int64_t)file_offset;
 		range.Length = (int64_t)buffer_out_len;
 		Azure::Storage::Files::DataLake::DownloadFileOptions options;
 		options.Range = range;
-		AzureReadTargets sink {targets};
 		afh.file_client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
-		total_read = sink.delivered;
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
 		                  "%s",
@@ -426,10 +424,10 @@ void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_of
 	} catch (const Azure::Core::RequestFailedException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 	}
-	if (total_read < buffer_out_len) {
+	if (sink.Written() < buffer_out_len) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' returned %llu of %llu requested "
 		                  "bytes",
-		                  afh.path, (uint64_t)total_read, (uint64_t)buffer_out_len);
+		                  afh.path, (uint64_t)sink.Written(), (uint64_t)buffer_out_len);
 	}
 }
 
