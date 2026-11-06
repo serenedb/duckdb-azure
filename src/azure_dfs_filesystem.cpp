@@ -305,7 +305,7 @@ vector<OpenFileInfo> AzureDfsStorageFileSystem::Glob(const string &path, FileOpe
 
 bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
                                                   const std::function<void(OpenFileInfo &info)> &callback,
-                                                  optional_ptr<FileOpener> opener, const ListFilesOptions &options) {
+                                                  optional_ptr<FileOpener> opener, const ListFilesOptions &listing) {
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
@@ -317,9 +317,9 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 
 	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
 	bool rv = false;
-	for (auto page = dir_client.ListPaths(options.recursive); page.HasPage(); page.MoveToNextPage()) {
+	for (auto page = dir_client.ListPaths(listing.recursive); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &child : page.Paths) {
-			if (options.recursive && child.IsDirectory) {
+			if (listing.recursive && child.IsDirectory) {
 				continue;
 			}
 			rv = true;
@@ -327,16 +327,18 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 			// only returns the child name without prefix.
 			OpenFileInfo info(child.Name.substr(child_strip_len));
 			info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
-			auto &extended = info.extended_info->options;
-			extended.emplace("type", Value(child.IsDirectory ? "directory" : "file"));
-			extended.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(child.FileSize)));
-			extended.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(child.LastModified)));
+			auto &options = info.extended_info->options;
+			Value file_type(child.IsDirectory ? "directory" : "file");
+			options.emplace("type", std::move(file_type));
+			options.emplace("file_size", Value::BIGINT(UnsafeNumericCast<int64_t>(child.FileSize)));
+			options.emplace("last_modified", Value::TIMESTAMP(ToTimestamp(child.LastModified)));
 			if (!child.IsDirectory) {
 				auto etag = StripETagQuotes(child.ETag);
 				if (!etag.empty()) {
-					extended.emplace("etag", Value(std::move(etag)));
+					options.emplace("etag", Value(std::move(etag)));
 				}
 			}
+
 			// NOTE: there's a LOT of metadata available, and tags, etc. -- see
 			// https://github.com/Azure/azure-sdk-for-cpp/blob/main/sdk/storage/azure-storage-blobs/inc/azure/storage/blobs/rest_client.hpp#L1134
 			// (struct BlobItemDetails) and

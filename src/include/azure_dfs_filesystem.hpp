@@ -51,7 +51,7 @@ class AzureDfsStorageFileSystem : public AzureStorageFileSystem {
 public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 	bool ListFilesExtended(const string &path_in, const std::function<void(OpenFileInfo &info)> &callback,
-	                       optional_ptr<FileOpener> opener, const ListFilesOptions &options) override;
+	                       optional_ptr<FileOpener> opener, const ListFilesOptions &listing) override;
 	bool SupportsListFilesExtended() const override {
 		return true;
 	}
