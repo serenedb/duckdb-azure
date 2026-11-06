@@ -271,11 +271,10 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 		return;
 	}
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
-	const auto size = write_buffer_offset;
-	write_buffer_offset = 0;
 	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
-		PutBlock(block_id, write_buffer.Ptr(), size);
+		PutBlock(block_id, write_buffer.Ptr(), write_buffer_offset);
 		staged_block_count++;
+		write_buffer_offset = 0;
 		return;
 	}
 	AwaitStaging(options.write_blocks_in_flight - 1);
@@ -284,7 +283,9 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 		blocks_in_flight++;
 	}
 	staged_block_count++;
-	auto task = make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::move(write_buffer), size);
+	auto task =
+	    make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::move(write_buffer), write_buffer_offset);
+	write_buffer_offset = 0;
 	auto &scheduler = TaskScheduler::GetScheduler(*db);
 	scheduler.ScheduleTask(scheduler.GetDatabaseProducer(), std::move(task), TaskSchedulerType::ASYNC);
 }
