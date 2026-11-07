@@ -112,13 +112,37 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	std::string body_out;
 	std::vector<uint8_t> body_in;
 
-	if (method == HttpMethod::Get) {
+	FileReadTargetWriter *sink = nullptr;
+	if (method == HttpMethod::Get && context.TryGetValue(AzureReadTargetsKey(), sink)) {
+		bool into_targets = false;
+		GetRequestInfo info(
+		    url, headers, *params,
+		    [&](const HTTPResponse &response) {
+			    const auto status = static_cast<int>(response.status);
+			    into_targets = status >= 200 && status < 300;
+			    sink->Reset();
+			    return !context.IsCancelled();
+		    },
+		    [&](const_data_ptr_t data, idx_t length) {
+			    if (!into_targets) {
+				    body_out.append(const_char_ptr_cast(data), length);
+			    } else if (!sink->Write(data, length)) {
+				    throw TransportException("request to '" + url + "' returned more bytes than it asked for");
+			    }
+			    return !context.IsCancelled();
+		    });
+		response = run(info);
+	} else if (method == HttpMethod::Get) {
 		GetRequestInfo info(
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
 	} else if (method == HttpMethod::Put) {
-		body_in = DrainRequestBody(request, context);
-		PutRequestInfo info(url, headers, *params, body_in.data(), body_in.size(), content_type);
+		AzureWriteBody body;
+		if (!context.TryGetValue(AzureWriteBodyKey(), body)) {
+			body_in = DrainRequestBody(request, context);
+			body = {body_in.data(), body_in.size()};
+		}
+		PutRequestInfo info(url, headers, *params, body.data, body.size, content_type);
 		response = run(info);
 	} else if (method == HttpMethod::Post) {
 		body_in = DrainRequestBody(request, context);
@@ -163,6 +187,16 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 }
 
 } // namespace
+
+const Azure::Core::Context::Key &AzureReadTargetsKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
+
+const Azure::Core::Context::Key &AzureWriteBodyKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
 
 std::shared_ptr<Azure::Core::Http::HttpTransport> CreateDuckDBTransport(optional_ptr<FileOpener> opener,
                                                                         const std::string &proxy,

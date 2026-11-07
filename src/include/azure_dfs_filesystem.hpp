@@ -34,6 +34,7 @@ public:
 	void StageWriteBuffer();
 	void Sync(bool close = false);
 	void Close() override;
+	void Abort() override;
 
 public:
 	Azure::Storage::Files::DataLake::DataLakeFileClient file_client;
@@ -50,7 +51,7 @@ class AzureDfsStorageFileSystem : public AzureStorageFileSystem {
 public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 	bool ListFilesExtended(const string &path_in, const std::function<void(OpenFileInfo &info)> &callback,
-	                       optional_ptr<FileOpener> opener) override;
+	                       optional_ptr<FileOpener> opener, const ListFilesOptions &listing) override;
 	bool SupportsListFilesExtended() const override {
 		return true;
 	}
@@ -90,7 +91,7 @@ protected:
 	unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                         optional_ptr<FileOpener> opener) override;
 
-	void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) override;
 };
 
 } // namespace duckdb

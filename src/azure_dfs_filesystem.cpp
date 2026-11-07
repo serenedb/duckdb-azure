@@ -1,5 +1,6 @@
 #include "azure_dfs_filesystem.hpp"
 
+#include "azure_duckdb_transport.hpp"
 #include "azure_storage_account_client.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -126,6 +127,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 	if (!(flags.OpenForWriting() || flags.OpenForAppending())) {
 		return;
 	}
+	if (aborted) {
+		throw IOException("Cannot sync '%s': its write was aborted", path);
+	}
 	try {
 		StageWriteBuffer();
 		if (staged_block_count == 0 && !close) {
@@ -133,7 +137,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 		}
 		Azure::Storage::Files::DataLake::FlushFileOptions flush_opts;
 		flush_opts.Close = close;
-		file_client.Flush(staged_offset, flush_opts);
+		auto res = file_client.Flush(staged_offset, flush_opts);
+		last_modified = AzureStorageFileSystem::ToTimestamp(res.Value.LastModified);
+		etag = AzureStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
 		staged_block_count = 0;
 	} catch (const Azure::Storage::StorageException &e) {
@@ -143,8 +149,17 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 }
 
 void AzureDfsStorageFileHandle::Close() {
+	if (aborted) {
+		return;
+	}
 	Sync(true);
 	DUCKDB_LOG_FILE_SYSTEM_CLOSE((*this));
+}
+
+void AzureDfsStorageFileHandle::Abort() {
+	AzureFileHandle::Abort();
+	write_buffer.reset();
+	write_buffer_offset = 0;
 }
 
 //////// AzureDfsStorageFileSystem ////////
@@ -290,7 +305,7 @@ vector<OpenFileInfo> AzureDfsStorageFileSystem::Glob(const string &path, FileOpe
 
 bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
                                                   const std::function<void(OpenFileInfo &info)> &callback,
-                                                  optional_ptr<FileOpener> opener) {
+                                                  optional_ptr<FileOpener> opener, const ListFilesOptions &listing) {
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
@@ -302,8 +317,11 @@ bool AzureDfsStorageFileSystem::ListFilesExtended(const string &path_in,
 
 	auto child_strip_len = url.path.size() + (StringUtil::EndsWith(url.path, "/") ? 0 : 1);
 	bool rv = false;
-	for (auto page = dir_client.ListPaths(false); page.HasPage(); page.MoveToNextPage()) {
+	for (auto page = dir_client.ListPaths(listing.recursive); page.HasPage(); page.MoveToNextPage()) {
 		for (auto &child : page.Paths) {
+			if (listing.recursive && child.IsDirectory) {
+				continue;
+			}
 			rv = true;
 			// Strangely, the DataLake API returns whole path, where the Blob API (correctly?)
 			// only returns the child name without prefix.
@@ -355,17 +373,21 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	};
 
 	auto create_file = [&]() {
-		auto res_create = afh.file_client.Create();
+		Azure::Storage::Files::DataLake::CreateFileOptions options;
+		if (afh.flags.ExclusiveCreate()) {
+			options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
+		}
+		auto res_create = afh.file_client.Create(options);
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
 
+	if (afh.flags.ExclusiveCreate()) {
+		return create_file();
+	}
 	try {
 		auto res_props = afh.file_client.GetProperties();
-		if (afh.flags.ExclusiveCreate()) {
-			throw IOException("AzureDfsStorageFileSystem will not open file: '%s', ExclusiveCreate specified "
-			                  "while file already exists.");
-		} else if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
+		if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
 			return truncate_file();
 		}
 		// NOTE: honor convention for S3/Azure "foo/" empty file -> "foo" dir marker
@@ -381,29 +403,22 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	}
 }
 
-void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out,
-                                          idx_t buffer_out_len) {
+void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
+                                          std::span<const FileReadTarget> targets) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
+	FileReadTargetWriter sink(targets);
+	const auto buffer_out_len = sink.Capacity();
 	if (buffer_out_len == 0) {
 		return;
 	}
 
-	idx_t total_read = 0;
 	try {
 		Azure::Core::Http::HttpRange range;
 		range.Offset = (int64_t)file_offset;
 		range.Length = (int64_t)buffer_out_len;
 		Azure::Storage::Files::DataLake::DownloadFileOptions options;
 		options.Range = range;
-		auto res = afh.file_client.Download(options);
-		auto &stream = *res.Value.Body;
-		while (total_read < buffer_out_len) {
-			auto read_now = stream.Read((uint8_t *)buffer_out + total_read, buffer_out_len - total_read);
-			if (read_now == 0) {
-				break;
-			}
-			total_read += read_now;
-		}
+		afh.file_client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
 		                  "%s",
@@ -411,10 +426,10 @@ void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_of
 	} catch (const Azure::Core::RequestFailedException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 	}
-	if (total_read < buffer_out_len) {
+	if (sink.Written() < buffer_out_len) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' returned %llu of %llu requested "
 		                  "bytes",
-		                  afh.path, (uint64_t)total_read, (uint64_t)buffer_out_len);
+		                  afh.path, (uint64_t)sink.Written(), (uint64_t)buffer_out_len);
 	}
 }
 
@@ -441,6 +456,9 @@ void AzureDfsStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t 
 
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
 		throw InternalException("Write called on file opened in read mode");
+	}
+	if (afh.aborted) {
+		throw IOException("Cannot write to '%s': its write was aborted", afh.path);
 	}
 
 	if (location != afh.file_offset || location != afh.length) {
