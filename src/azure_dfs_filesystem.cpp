@@ -116,8 +116,10 @@ void AzureDfsStorageFileHandle::StageWriteBuffer() {
 	if (write_buffer_offset == 0) {
 		return;
 	}
-	auto body_stream = Azure::Core::IO::MemoryBodyStream(write_buffer.get(), write_buffer_offset);
-	file_client.Append(body_stream, staged_offset);
+	const HTTPBodyPiece body {write_buffer.get(), write_buffer_offset};
+	AzureWriteBodyStream body_stream({&body, 1});
+	file_client.Append(body_stream, staged_offset, Azure::Storage::Files::DataLake::AppendFileOptions(),
+	                   Azure::Core::Context().WithValue(AzureWriteBodyKey(), &body_stream));
 	staged_offset += write_buffer_offset;
 	staged_block_count++;
 	write_buffer_offset = 0;
