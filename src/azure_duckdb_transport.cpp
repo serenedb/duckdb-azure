@@ -90,12 +90,13 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	const auto &method = request.GetMethod();
 
 	// Headers were already signed by the SDK pipeline: pass them through
-	// verbatim. Content-Type is carried separately for PUT because the duckdb
-	// client sets it from the request info.
+	// verbatim. Content-Type is carried separately for PUT and PATCH because
+	// the duckdb client sets it from the request info.
+	const bool sends_body = method == HttpMethod::Put || method == HttpMethod::Patch;
 	HTTPHeaders headers;
 	std::string content_type;
 	for (const auto &header : request.GetHeaders()) {
-		if (method == HttpMethod::Put && StringUtil::CIEquals(header.first, "content-type")) {
+		if (sends_body && StringUtil::CIEquals(header.first, "content-type")) {
 			content_type = header.second;
 			continue;
 		}
@@ -136,7 +137,7 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		GetRequestInfo info(
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
-	} else if (method == HttpMethod::Put) {
+	} else if (sends_body) {
 		AzureWriteBodyStream *stream = nullptr;
 		HTTPBodyPiece drained;
 		std::span<const HTTPBodyPiece> body;
@@ -147,8 +148,13 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 			drained = {body_in.data(), body_in.size()};
 			body = {&drained, 1};
 		}
-		PutRequestInfo info(url, headers, *params, body, content_type);
-		response = run(info);
+		if (method == HttpMethod::Put) {
+			PutRequestInfo info(url, headers, *params, body, content_type);
+			response = run(info);
+		} else {
+			PatchRequestInfo info(url, headers, *params, body, content_type);
+			response = run(info);
+		}
 	} else if (method == HttpMethod::Post) {
 		body_in = DrainRequestBody(request, context);
 		PostRequestInfo info(url, headers, *params, body_in.data(), body_in.size());
