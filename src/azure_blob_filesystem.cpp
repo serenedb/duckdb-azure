@@ -144,6 +144,44 @@ AzureBlobContextState::GetBlobContainerClient(const std::string &blobContainerNa
 	return service_client.GetBlobContainerClient(blobContainerName);
 }
 
+//////// AzureWriteBlock ////////
+namespace {
+
+class CopiedBytes final : public FileWriteHold {
+public:
+	explicit CopiedBytes(AllocatedData data_p) : data(std::move(data_p)) {
+	}
+
+	AllocatedData data;
+};
+
+} // namespace
+
+void AzureWriteBlock::Hold(const_data_ptr_t data, idx_t count, unique_ptr<FileWriteHold> hold) {
+	pieces.push_back({data, count});
+	holds.push_back(std::move(hold));
+	size += count;
+	room = 0;
+}
+
+idx_t AzureWriteBlock::Copy(Allocator &allocator, idx_t block_size, const_data_ptr_t data, idx_t count) {
+	if (room == 0) {
+		D_ASSERT(size < block_size);
+		room = block_size - size;
+		auto buffer = make_uniq<CopiedBytes>(allocator.Allocate(room));
+		tail = buffer->data.get();
+		pieces.push_back({tail, 0});
+		holds.push_back(std::move(buffer));
+	}
+	const auto copied = MinValue(count, room);
+	memcpy(tail, data, copied);
+	tail += copied;
+	room -= copied;
+	pieces.back().size += copied;
+	size += copied;
+	return copied;
+}
+
 //////// AzureBlobStorageFileHandle ////////
 static ErrorData StagingError(const IOException &error) {
 	return ErrorData(error, std::make_exception_ptr(error));
@@ -151,8 +189,8 @@ static ErrorData StagingError(const IOException &error) {
 
 class AzureStageBlockTask : public Task {
 public:
-	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, BufferHandle data_p, idx_t size_p)
-	    : handle(handle_p), block_id(std::move(block_id_p)), data(std::move(data_p)), size(size_p) {
+	AzureStageBlockTask(AzureBlobStorageFileHandle &handle_p, string block_id_p, AzureWriteBlock block_p)
+	    : handle(handle_p), block_id(std::move(block_id_p)), block(std::move(block_p)) {
 	}
 
 	~AzureStageBlockTask() override {
@@ -164,8 +202,8 @@ public:
 
 	TaskExecutionResult Execute(TaskExecutionMode mode) override {
 		ran = true;
-		handle.StageBlock(block_id, data.Ptr(), size);
-		data.Destroy();
+		handle.StageBlock(block_id, block.Pieces());
+		block = AzureWriteBlock();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
 
@@ -176,8 +214,7 @@ public:
 private:
 	AzureBlobStorageFileHandle &handle;
 	string block_id;
-	BufferHandle data;
-	idx_t size;
+	AzureWriteBlock block;
 	bool ran = false;
 };
 
@@ -203,16 +240,16 @@ AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
 	AwaitStagingNoThrow();
 }
 
-void AzureBlobStorageFileHandle::PutBlock(const string &block_id, const_data_ptr_t data, idx_t size) {
-	auto body_stream = Azure::Core::IO::MemoryBodyStream(data, size);
+void AzureBlobStorageFileHandle::PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body) {
+	AzureWriteBodyStream body_stream(body);
 	BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(),
-	                         staging_context.WithValue(AzureWriteBodyKey(), AzureWriteBody {data, size}));
+	                         staging_context.WithValue(AzureWriteBodyKey(), &body_stream));
 }
 
-void AzureBlobStorageFileHandle::StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept {
+void AzureBlobStorageFileHandle::StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept {
 	ErrorData error;
 	try {
-		PutBlock(block_id, data, size);
+		PutBlock(block_id, body);
 	} catch (const Azure::Storage::StorageException &e) {
 		error = StagingError(
 		    IOException("AzureBlobStorageFileSystem staging a block of '%s' failed with %s Reason Phrase: %s", path,
@@ -267,14 +304,14 @@ void AzureBlobStorageFileHandle::AwaitStagingNoThrow() noexcept {
 }
 
 void AzureBlobStorageFileHandle::StageWriteBuffer() {
-	if (write_buffer_offset == 0) {
+	if (write_block.Size() == 0) {
 		return;
 	}
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
 	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
-		PutBlock(block_id, write_buffer.Ptr(), write_buffer_offset);
+		PutBlock(block_id, write_block.Pieces());
 		staged_block_count++;
-		write_buffer_offset = 0;
+		write_block = AzureWriteBlock();
 		return;
 	}
 	AwaitStaging(options.write_blocks_in_flight - 1);
@@ -283,11 +320,19 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 		blocks_in_flight++;
 	}
 	staged_block_count++;
-	auto task =
-	    make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::move(write_buffer), write_buffer_offset);
-	write_buffer_offset = 0;
+	auto task = make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::exchange(write_block, {}));
 	auto &scheduler = TaskScheduler::GetScheduler(*db);
 	scheduler.ScheduleTask(scheduler.GetDatabaseProducer(), std::move(task), TaskSchedulerType::ASYNC);
+}
+
+void AzureBlobStorageFileHandle::StageIfFull() {
+	if (write_block.Size() < options.write_block_size) {
+		return;
+	}
+	StageWriteBuffer();
+	if (options.write_staged_blocks_per_commit > 0 && staged_block_count >= options.write_staged_blocks_per_commit) {
+		Sync();
+	}
 }
 
 void AzureBlobStorageFileHandle::Sync() {
@@ -335,8 +380,7 @@ void AzureBlobStorageFileHandle::Abort() {
 	AzureFileHandle::Abort();
 	staging_context.Cancel();
 	AwaitStagingNoThrow();
-	write_buffer.Destroy();
-	write_buffer_offset = 0;
+	write_block = AzureWriteBlock();
 }
 
 //////// AzureBlobStorageFileSystem ////////
@@ -754,10 +798,18 @@ int64_t AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int6
 	return nr_bytes;
 }
 
-// Write pipeline: data accumulates in write_buffer; full blocks are StageBlock'd to Azure;
-// on Sync/Close, all staged blocks are committed via CommitBlockList.
 void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	D_ASSERT(nr_bytes >= 0);
+	WriteAt(handle, static_cast<const_data_ptr_t>(buffer), static_cast<idx_t>(nr_bytes), location, nullptr);
+}
+
+void AzureBlobStorageFileSystem::WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location,
+                                           unique_ptr<FileWriteHold> hold) {
+	WriteAt(handle, buffer, nr_bytes, location, std::move(hold));
+}
+
+void AzureBlobStorageFileSystem::WriteAt(FileHandle &handle, const_data_ptr_t data, idx_t size, idx_t location,
+                                         unique_ptr<FileWriteHold> hold) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
 
 	if (!(afh.flags.OpenForWriting() || afh.flags.OpenForAppending())) {
@@ -769,34 +821,20 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 
 	D_ASSERT(location == afh.file_offset);
 
-	const idx_t block_size = afh.options.write_block_size;
-	auto *src = static_cast<const uint8_t *>(buffer);
-	idx_t remaining = static_cast<idx_t>(nr_bytes);
-
-	while (remaining > 0) {
-		if (!afh.write_buffer.IsValid()) {
-			afh.write_buffer =
-			    BufferManager::GetBufferManager(*afh.Database()).Allocate(MemoryTag::EXTENSION, block_size);
-		}
-		idx_t space = block_size - afh.write_buffer_offset;
-		idx_t to_copy = MinValue<idx_t>(space, remaining);
-		memcpy(afh.write_buffer.GetDataMutable() + afh.write_buffer_offset, src, to_copy);
-		afh.write_buffer_offset += to_copy;
-		src += to_copy;
-		remaining -= to_copy;
-
-		if (afh.write_buffer_offset == block_size) {
-			afh.StageWriteBuffer();
-			if (afh.options.write_staged_blocks_per_commit > 0 &&
-			    afh.staged_block_count >= afh.options.write_staged_blocks_per_commit) {
-				afh.Sync();
-			}
+	if (hold) {
+		afh.write_block.Hold(data, size, std::move(hold));
+		afh.StageIfFull();
+	} else {
+		auto &allocator = BufferManager::GetBufferManager(*afh.Database()).GetBufferAllocator();
+		for (idx_t done = 0; done < size;) {
+			done += afh.write_block.Copy(allocator, afh.options.write_block_size, data + done, size - done);
+			afh.StageIfFull();
 		}
 	}
 
-	afh.file_offset += nr_bytes;
-	afh.length += nr_bytes;
-	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, nr_bytes, afh.file_offset);
+	afh.file_offset += size;
+	afh.length += size;
+	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, size, afh.file_offset);
 }
 
 void AzureBlobStorageFileSystem::FileSync(FileHandle &handle) {

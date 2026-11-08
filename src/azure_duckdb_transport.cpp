@@ -137,12 +137,17 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
 	} else if (method == HttpMethod::Put) {
-		AzureWriteBody body;
-		if (!context.TryGetValue(AzureWriteBodyKey(), body)) {
+		AzureWriteBodyStream *stream = nullptr;
+		HTTPBodyPiece drained;
+		std::span<const HTTPBodyPiece> body;
+		if (context.TryGetValue(AzureWriteBodyKey(), stream) && request.GetBodyStream() == stream) {
+			body = stream->Pieces();
+		} else {
 			body_in = DrainRequestBody(request, context);
-			body = {body_in.data(), body_in.size()};
+			drained = {body_in.data(), body_in.size()};
+			body = {&drained, 1};
 		}
-		PutRequestInfo info(url, headers, *params, body.data, body.size, content_type);
+		PutRequestInfo info(url, headers, *params, body, content_type);
 		response = run(info);
 	} else if (method == HttpMethod::Post) {
 		body_in = DrainRequestBody(request, context);
@@ -187,6 +192,17 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 }
 
 } // namespace
+
+AzureWriteBodyStream::AzureWriteBodyStream(std::span<const HTTPBodyPiece> pieces_p)
+    : pieces(pieces_p), reader(pieces_p) {
+	for (auto &piece : pieces) {
+		size += piece.size;
+	}
+}
+
+size_t AzureWriteBodyStream::OnRead(uint8_t *buffer, size_t count, Azure::Core::Context const &context) {
+	return reader.Read(buffer, count);
+}
 
 const Azure::Core::Context::Key &AzureReadTargetsKey() {
 	static const Azure::Core::Context::Key key;

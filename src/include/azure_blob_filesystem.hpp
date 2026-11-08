@@ -3,19 +3,40 @@
 #include "azure_filesystem.hpp"
 #include "azure_parsed_url.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
-#include "duckdb/storage/buffer/buffer_handle.hpp"
+#include "duckdb/main/http/http_util.hpp"
 
 #include <azure/core/context.hpp>
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
 #include <azure/storage/blobs/block_blob_client.hpp>
+#include <span>
 #include <string>
 
 namespace duckdb {
+
+class AzureWriteBlock {
+public:
+	void Hold(const_data_ptr_t data, idx_t count, unique_ptr<FileWriteHold> hold);
+	idx_t Copy(Allocator &allocator, idx_t block_size, const_data_ptr_t data, idx_t count);
+	idx_t Size() const {
+		return size;
+	}
+	std::span<const HTTPBodyPiece> Pieces() const {
+		return pieces;
+	}
+
+private:
+	vector<HTTPBodyPiece> pieces;
+	vector<unique_ptr<FileWriteHold>> holds;
+	data_ptr_t tail = nullptr;
+	idx_t room = 0;
+	idx_t size = 0;
+};
 
 class AzureBlobContextState : public AzureContextState {
 public:
@@ -37,10 +58,11 @@ public:
 	~AzureBlobStorageFileHandle() override;
 
 	void StageWriteBuffer();
+	void StageIfFull();
 	void Sync();
 	void Close() override;
 	void Abort() override;
-	void StageBlock(const string &block_id, const_data_ptr_t data, idx_t size) noexcept;
+	void StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept;
 	void FinishStaging(ErrorData error) noexcept;
 	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
 	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient();
@@ -52,11 +74,10 @@ public:
 public:
 	size_t committed_block_count = 0; // maintain position while open; only used if Sync() called before Close()
 	uint32_t staged_block_count = 0;
-	BufferHandle write_buffer;
-	idx_t write_buffer_offset = 0;
+	AzureWriteBlock write_block;
 
 private:
-	void PutBlock(const string &block_id, const_data_ptr_t data, idx_t size);
+	void PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body);
 	void AwaitStaging(idx_t limit);
 	void AwaitStagingNoThrow() noexcept;
 
@@ -95,6 +116,8 @@ public:
 	void LoadRemoteFileInfo(AzureFileHandle &handle) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
+	void WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location,
+	               unique_ptr<FileWriteHold> hold) override;
 	void FileSync(FileHandle &handle) override;
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
@@ -121,6 +144,9 @@ protected:
 	                                         optional_ptr<FileOpener> opener) override;
 
 	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) override;
+
+private:
+	void WriteAt(FileHandle &handle, const_data_ptr_t data, idx_t size, idx_t location, unique_ptr<FileWriteHold> hold);
 };
 
 } // namespace duckdb
