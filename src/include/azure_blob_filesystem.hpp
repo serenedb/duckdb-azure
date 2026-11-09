@@ -116,7 +116,7 @@ public:
 	void LoadRemoteFileInfo(AzureFileHandle &handle) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
-	void WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location,
+	void WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location, uint32_t crc32c,
 	               unique_ptr<FileWriteHold> hold) override;
 	void FileSync(FileHandle &handle) override;
 

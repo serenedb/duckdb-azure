@@ -804,7 +804,7 @@ void AzureBlobStorageFileSystem::Write(FileHandle &handle, void *buffer, int64_t
 }
 
 void AzureBlobStorageFileSystem::WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location,
-                                           unique_ptr<FileWriteHold> hold) {
+                                           uint32_t crc32c, unique_ptr<FileWriteHold> hold) {
 	WriteAt(handle, buffer, nr_bytes, location, std::move(hold));
 }
 
