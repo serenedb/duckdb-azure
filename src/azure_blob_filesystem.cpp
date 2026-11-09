@@ -10,6 +10,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
@@ -130,6 +131,37 @@ static void DeleteBlobs(const Azure::Storage::Blobs::BlobContainerClient &contai
 			                  "Phrase: %s",
 			                  end - begin, container.GetUrl(), e.ErrorCode, e.ReasonPhrase);
 		}
+	}
+}
+
+static string DirectoryPrefix(const string &directory) {
+	return !directory.empty() && directory.back() == '/' ? directory : directory + '/';
+}
+
+static constexpr const char *CREATE_ID_METADATA = "duckdb_create_id";
+
+static bool TryCreateEmptyBlob(const Azure::Storage::Blobs::BlockBlobClient &blob) {
+	const auto create_id = UUID::ToString(UUID::GenerateRandomUUID());
+	Azure::Storage::Blobs::CommitBlockListOptions options;
+	options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
+	options.Metadata.emplace(CREATE_ID_METADATA, create_id);
+	try {
+		blob.CommitBlockList({}, options);
+		return true;
+	} catch (const Azure::Storage::StorageException &e) {
+		if (e.ErrorCode != "BlobAlreadyExists" && e.ErrorCode != "ConditionNotMet") {
+			throw;
+		}
+	}
+	try {
+		auto properties = blob.GetProperties();
+		auto entry = properties.Value.Metadata.find(CREATE_ID_METADATA);
+		return entry != properties.Value.Metadata.end() && entry->second == create_id;
+	} catch (const Azure::Storage::StorageException &e) {
+		if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+			throw;
+		}
+		return false;
 	}
 }
 
@@ -462,6 +494,9 @@ vector<OpenFileInfo> AzureBlobStorageFileSystem::Glob(const string &path, FileOp
 
 		// Ensure that the retrieved element match the expected pattern
 		for (const auto &key : res.Blobs) {
+			if (StringUtil::EndsWith(key.Name, "/")) {
+				continue;
+			}
 			vector<string> key_splits = StringUtil::Split(key.Name, "/");
 			bool is_match = Match(key_splits.begin(), key_splits.end(), pattern_splits.begin(), pattern_splits.end());
 
@@ -497,8 +532,7 @@ bool AzureBlobStorageFileSystem::ListFilesExtended(const string &path_in,
 	if (path_in.find('*') != string::npos) {
 		throw InvalidInputException("ListFiles does not support globs");
 	}
-	// Normalize: to end with '/' so it's a clear dir prefix
-	auto path = (!path_in.empty() && path_in.back() == '/') ? path_in : (path_in + '/');
+	auto path = DirectoryPrefix(path_in);
 	auto url = ParseUrl(path);
 	auto storage_context = GetOrCreateStorageContext(opener, path, url);
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
@@ -598,32 +632,56 @@ void AzureBlobStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 	}
 }
 
+bool AzureBlobStorageFileSystem::CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+                                                         optional_ptr<FileOpener> opener) {
+	const auto prefix = DirectoryPrefix(directory);
+	auto url = ParseUrl(prefix);
+	if (url.path.empty()) {
+		return false;
+	}
+	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+	try {
+		return TryCreateEmptyBlob(container.GetBlockBlobClient(url.path));
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException({{"status_code", std::to_string(int(e.StatusCode))}},
+		                  "AzureBlobStorageFileSystem creating directory '%s' failed with %s Reason Phrase: %s",
+		                  directory, e.ErrorCode, e.ReasonPhrase);
+	} catch (const Azure::Core::RequestFailedException &e) {
+		throw IOException("AzureBlobStorageFileSystem creating directory '%s' failed: %s", directory, e.what());
+	}
+}
+
 FileExistence AzureBlobStorageFileSystem::TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
                                                              optional_ptr<ErrorData> error) {
-	// NOTE: existance of directory makes no sense in Blob -- since the concept isn't present.
-	// That said we fake it -- if glob(dir/*) returns anything at all, say it exists, otherwise not.
-	// If we want to, could add an option to behave in this, way, always return true or even always false.
-	// This mechanism of relying on dir/ is also frequently used to fake dirs in e.g. S3, so it's consistent
-	// with other common practice.
 	if (opener == nullptr) {
 		throw InternalException("Cannot do Azure storage directory test without FileOpener");
 	}
-	// auto handle = OpenFile(dirname, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
-	auto dir_slashed = dirname[dirname.length() - 1] == '/' ? dirname : (dirname + '/');
+	const auto prefix = DirectoryPrefix(dirname);
 	try {
-		auto dir_url = ParseUrl(dir_slashed);
-		auto storage_context = GetOrCreateStorageContext(opener, dirname, dir_url);
-		auto container_client = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(dir_url.container);
-
+		auto url = ParseUrl(prefix);
+		if (url.path.empty()) {
+			return FileExistence::EXISTS;
+		}
+		auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
+		auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);
+		try {
+			container.GetBlobClient(url.path).GetProperties();
+			return FileExistence::EXISTS;
+		} catch (const Azure::Storage::StorageException &e) {
+			if (e.StatusCode != Azure::Core::Http::HttpStatusCode::NotFound) {
+				throw;
+			}
+		}
 		Azure::Storage::Blobs::ListBlobsOptions options;
-		options.Prefix = dir_url.path;
-		auto res = container_client.ListBlobs(options);
-		return res.Blobs.empty() ? FileExistence::MISSING : FileExistence::EXISTS;
+		options.Prefix = url.path;
+		options.PageSizeHint = 1;
+		return container.ListBlobs(options).Blobs.empty() ? FileExistence::MISSING : FileExistence::EXISTS;
 	} catch (Azure::Storage::StorageException &e) {
 		return ClassifyExistenceFailure(
 		    IOException({{"status_code", std::to_string(int(e.StatusCode))}},
-		                "AzureBlobStorageFileSystem Read to %s failed with %s Reason Phrase: %s", dir_slashed,
-		                e.ErrorCode, e.ReasonPhrase),
+		                "AzureBlobStorageFileSystem Read to %s failed with %s Reason Phrase: %s", prefix, e.ErrorCode,
+		                e.ReasonPhrase),
 		    error);
 	} catch (std::exception &ex) {
 		return ClassifyExistenceFailure(ex, error);
@@ -692,7 +750,7 @@ void AzureBlobStorageFileSystem::RemoveFiles(const vector<string> &filenames, op
 
 void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	vector<string> names;
-	const auto prefix = (!directory.empty() && directory.back() == '/') ? directory : directory + "/";
+	const auto prefix = DirectoryPrefix(directory);
 	auto url = ParseUrl(prefix);
 	auto storage_context = GetOrCreateStorageContext(opener, prefix, url);
 	auto container = storage_context->As<AzureBlobContextState>().GetBlobContainerClient(url.container);

@@ -103,7 +103,10 @@ public:
 	// FS methods
 	bool CanHandleFile(const string &fpath) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		CreateDirectoryExtended(directory, {CreateDirectoryMode::SINGLE}, opener);
 	}
+	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
 	FileExistence TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
 	                                 optional_ptr<ErrorData> error) override;
 	FileExistence TryFileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr,
