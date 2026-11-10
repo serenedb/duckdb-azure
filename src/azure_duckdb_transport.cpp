@@ -71,8 +71,8 @@ std::vector<uint8_t> DuckDBTransport::DrainRequestBody(Azure::Core::Http::Reques
 	if (len < 0) {
 		return stream->ReadToEnd(context);
 	}
-	// The pipeline RetryPolicy rewinds the stream between attempts; a fresh
-	// attempt always starts at position 0, so no rewind is needed here.
+	// The pipeline sends a request once, so the stream is at position 0 and
+	// no rewind is needed here.
 	body.resize(static_cast<size_t>(len));
 	auto read = stream->ReadToCount(body.data(), body.size(), context);
 	body.resize(read);
