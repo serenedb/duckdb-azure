@@ -3,15 +3,40 @@
 #include "azure_filesystem.hpp"
 #include "azure_parsed_url.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/allocator.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/main/http/http_util.hpp"
 
+#include <azure/core/context.hpp>
 #include <azure/storage/blobs/blob_client.hpp>
 #include <azure/storage/blobs/blob_service_client.hpp>
 #include <azure/storage/blobs/block_blob_client.hpp>
+#include <span>
 #include <string>
 
 namespace duckdb {
+
+class AzureWriteBlock {
+public:
+	void Hold(const_data_ptr_t data, idx_t count, unique_ptr<FileWriteHold> hold);
+	idx_t Copy(Allocator &allocator, idx_t block_size, const_data_ptr_t data, idx_t count);
+	idx_t Size() const {
+		return size;
+	}
+	std::span<const HTTPBodyPiece> Pieces() const {
+		return pieces;
+	}
+
+private:
+	vector<HTTPBodyPiece> pieces;
+	vector<unique_ptr<FileWriteHold>> holds;
+	data_ptr_t tail = nullptr;
+	idx_t room = 0;
+	idx_t size = 0;
+};
 
 class AzureBlobContextState : public AzureContextState {
 public:
@@ -28,26 +53,48 @@ class AzureBlobStorageFileSystem;
 class AzureBlobStorageFileHandle : public AzureFileHandle {
 public:
 	AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info, FileOpenFlags flags,
-	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client);
-	~AzureBlobStorageFileHandle() override = default;
+	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client,
+	                           optional_ptr<DatabaseInstance> db);
+	~AzureBlobStorageFileHandle() override;
 
 	void StageWriteBuffer();
+	void StageIfFull();
 	void Sync();
 	void Close() override;
+	void Abort() override;
+	void StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept;
+	void FinishStaging(ErrorData error) noexcept;
+	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
+	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient();
+	void SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client);
+	optional_ptr<DatabaseInstance> Database() const {
+		return db;
+	}
 
 public:
-	Azure::Storage::Blobs::BlockBlobClient blob_client;
 	size_t committed_block_count = 0; // maintain position while open; only used if Sync() called before Close()
 	uint32_t staged_block_count = 0;
-	duckdb::unique_ptr<data_t[]> write_buffer;
-	idx_t write_buffer_offset = 0;
+	AzureWriteBlock write_block;
+
+private:
+	void PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body);
+	void AwaitStaging(idx_t limit);
+	void AwaitStagingNoThrow() noexcept;
+
+	optional_ptr<DatabaseInstance> db;
+	Azure::Core::Context staging_context;
+	annotated_mutex blob_client_lock;
+	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> blob_client DUCKDB_GUARDED_BY(blob_client_lock);
+	annotated_mutex staging_lock;
+	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
+	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
 };
 
 class AzureBlobStorageFileSystem : public AzureStorageFileSystem {
 public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 	bool ListFilesExtended(const string &directory, const std::function<void(OpenFileInfo &info)> &callback,
-	                       optional_ptr<FileOpener> opener) override;
+	                       optional_ptr<FileOpener> opener, const ListFilesOptions &options) override;
 
 	bool SupportsListFilesExtended() const override {
 		return true;
@@ -56,7 +103,10 @@ public:
 	// FS methods
 	bool CanHandleFile(const string &fpath) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
+		CreateDirectoryExtended(directory, {CreateDirectoryMode::SINGLE}, opener);
 	}
+	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
 	FileExistence TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
 	                                 optional_ptr<ErrorData> error) override;
 	FileExistence TryFileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr,
@@ -69,10 +119,15 @@ public:
 	void LoadRemoteFileInfo(AzureFileHandle &handle) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
+	void WriteHeld(FileHandle &handle, data_ptr_t buffer, idx_t nr_bytes, idx_t location, uint32_t crc32c,
+	               unique_ptr<FileWriteHold> hold) override;
 	void FileSync(FileHandle &handle) override;
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
+	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
 public:
 	static const string SCHEME;
@@ -91,7 +146,10 @@ protected:
 	unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                         optional_ptr<FileOpener> opener) override;
 
-	void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) override;
+
+private:
+	void WriteAt(FileHandle &handle, const_data_ptr_t data, idx_t size, idx_t location, unique_ptr<FileWriteHold> hold);
 };
 
 } // namespace duckdb

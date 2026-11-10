@@ -68,14 +68,19 @@ bool AzureFileHandle::PostConstruct() {
 	return static_cast<AzureStorageFileSystem &>(file_system).LoadFileInfo(*this);
 }
 
+void AzureFileHandle::Abort() {
+	aborted = true;
+}
+
 bool AzureStorageFileSystem::LoadFileInfo(AzureFileHandle &handle) {
 	try {
 		LoadRemoteFileInfo(handle);
-		if (handle.flags.ReturnNullIfExists()) {
-			return false;
-		}
 	} catch (const Azure::Storage::StorageException &e) {
 		if (int(e.StatusCode) == 404 && handle.flags.ReturnNullIfNotExists()) {
+			return false;
+		}
+		if ((e.ErrorCode == "BlobAlreadyExists" || e.ErrorCode == "PathAlreadyExists") &&
+		    handle.flags.ReturnNullIfExists()) {
 			return false;
 		}
 		throw IOException(
@@ -132,6 +137,10 @@ idx_t AzureStorageFileSystem::SeekPosition(FileHandle &handle) {
 	return afh.file_offset;
 }
 
+void AzureStorageFileSystem::AbortFileWrite(FileHandle &handle) {
+	handle.Cast<AzureFileHandle>().Abort();
+}
+
 // TODO: this code is identical to HTTPFS, look into unifying it
 void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &hfh = handle.Cast<AzureFileHandle>();
@@ -145,7 +154,8 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 			return;
 		}
-		ReadRange(hfh, location, (char *)buffer, to_read);
+		const FileReadTarget target {data_ptr_cast(buffer), to_read};
+		ReadRange(hfh, location, std::span(&target, 1));
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
@@ -179,13 +189,15 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 
 			// Bypass buffer if we read more than buffer size
 			if (to_read > new_buffer_available) {
-				ReadRange(hfh, location + buffer_offset, (char *)buffer + buffer_offset, to_read);
+				const FileReadTarget target {data_ptr_cast(buffer) + buffer_offset, to_read};
+				ReadRange(hfh, location + buffer_offset, std::span(&target, 1));
 				hfh.buffer_available = 0;
 				hfh.buffer_idx = 0;
 				hfh.file_offset += to_read;
 				break;
 			} else {
-				ReadRange(hfh, hfh.file_offset, (char *)hfh.read_buffer.get(), new_buffer_available);
+				const FileReadTarget target {data_ptr_cast(hfh.read_buffer.get()), new_buffer_available};
+				ReadRange(hfh, hfh.file_offset, std::span(&target, 1));
 				hfh.buffer_available = new_buffer_available;
 				hfh.buffer_idx = 0;
 				hfh.buffer_start = hfh.file_offset;
@@ -194,6 +206,15 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 		}
 	}
 	DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
+}
+
+void AzureStorageFileSystem::ReadScattered(FileHandle &handle, std::span<const FileReadTarget> targets,
+                                           idx_t location) {
+	const auto size = FileReadTarget::TotalSize(targets);
+	if (size != 0) {
+		ReadRange(handle.Cast<AzureFileHandle>(), location, targets);
+	}
+	DUCKDB_LOG_FILE_SYSTEM_READ(handle, size, location);
 }
 
 int64_t AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -296,6 +317,11 @@ AzureOptions AzureStorageFileSystem::ParseAzureOptions(optional_ptr<FileOpener> 
 	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_staged_blocks_per_commit",
 	                                     write_staged_blocks_per_commit_val)) {
 		options.write_staged_blocks_per_commit = write_staged_blocks_per_commit_val.GetValue<idx_t>();
+	}
+
+	Value write_blocks_in_flight_val;
+	if (FileOpener::TryGetCurrentSetting(opener, "azure_write_blocks_in_flight", write_blocks_in_flight_val)) {
+		options.write_blocks_in_flight = write_blocks_in_flight_val.GetValue<idx_t>();
 	}
 
 	return options;

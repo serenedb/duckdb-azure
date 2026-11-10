@@ -116,6 +116,7 @@ static T ToClientOptions(const Azure::Core::Http::Policies::TransportOptions &tr
 	              "type parameter must be an Azure ClientOptions");
 	T options;
 	options.Transport = transport_options;
+	options.Retry.MaxRetries = 0;
 
 	auto http_state = GetHttpState(opener);
 	if (http_state != nullptr) {

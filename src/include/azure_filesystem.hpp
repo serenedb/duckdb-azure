@@ -23,6 +23,7 @@ struct AzureOptions {
 	idx_t read_buffer_size = (idx_t)8 * 1024 * 1024;
 	idx_t write_block_size = WRITE_BLOCK_SIZE_DEFAULT;
 	idx_t write_staged_blocks_per_commit = 0;
+	idx_t write_blocks_in_flight = 20;
 };
 
 class AzureContextState : public ClientContextState {
@@ -56,6 +57,7 @@ class AzureStorageFileSystem;
 class AzureFileHandle : public FileHandle {
 public:
 	virtual bool PostConstruct();
+	virtual void Abort();
 
 	bool IsRemoteLoaded() {
 		return is_remote_loaded;
@@ -71,6 +73,7 @@ protected:
 
 public:
 	FileOpenFlags flags;
+	bool aborted = false;
 
 	// File info
 	bool is_remote_loaded;
@@ -99,6 +102,7 @@ public:
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+	void ReadScattered(FileHandle &handle, std::span<const FileReadTarget> targets, idx_t location) override;
 	bool CanSeek() override {
 		return true;
 	}
@@ -113,6 +117,7 @@ public:
 	string GetVersionTag(FileHandle &handle) override;
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
+	void AbortFileWrite(FileHandle &handle) override;
 
 	bool LoadFileInfo(AzureFileHandle &handle);
 
@@ -130,7 +135,9 @@ protected:
 
 	virtual duckdb::unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                                         optional_ptr<FileOpener> opener) = 0;
-	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) = 0;
+	//! GETs exactly the bytes [targets] take at [file_offset], into them in order; a target without data skips its
+	//! bytes
+	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) = 0;
 
 	virtual const string &GetContextPrefix() const = 0;
 	shared_ptr<AzureContextState> GetOrCreateStorageContext(optional_ptr<FileOpener> opener, const string &path,

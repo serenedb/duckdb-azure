@@ -71,8 +71,8 @@ std::vector<uint8_t> DuckDBTransport::DrainRequestBody(Azure::Core::Http::Reques
 	if (len < 0) {
 		return stream->ReadToEnd(context);
 	}
-	// The pipeline RetryPolicy rewinds the stream between attempts; a fresh
-	// attempt always starts at position 0, so no rewind is needed here.
+	// The pipeline sends a request once, so the stream is at position 0 and
+	// no rewind is needed here.
 	body.resize(static_cast<size_t>(len));
 	auto read = stream->ReadToCount(body.data(), body.size(), context);
 	body.resize(read);
@@ -90,12 +90,13 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	const auto &method = request.GetMethod();
 
 	// Headers were already signed by the SDK pipeline: pass them through
-	// verbatim. Content-Type is carried separately for PUT because the duckdb
-	// client sets it from the request info.
+	// verbatim. Content-Type is carried separately for PUT and PATCH because
+	// the duckdb client sets it from the request info.
+	const bool sends_body = method == HttpMethod::Put || method == HttpMethod::Patch;
 	HTTPHeaders headers;
 	std::string content_type;
 	for (const auto &header : request.GetHeaders()) {
-		if (method == HttpMethod::Put && StringUtil::CIEquals(header.first, "content-type")) {
+		if (sends_body && StringUtil::CIEquals(header.first, "content-type")) {
 			content_type = header.second;
 			continue;
 		}
@@ -112,14 +113,48 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 	std::string body_out;
 	std::vector<uint8_t> body_in;
 
-	if (method == HttpMethod::Get) {
+	FileReadTargetWriter *sink = nullptr;
+	if (method == HttpMethod::Get && context.TryGetValue(AzureReadTargetsKey(), sink)) {
+		bool into_targets = false;
+		GetRequestInfo info(
+		    url, headers, *params,
+		    [&](const HTTPResponse &response) {
+			    const auto status = static_cast<int>(response.status);
+			    into_targets = status >= 200 && status < 300;
+			    sink->Reset();
+			    return !context.IsCancelled();
+		    },
+		    [&](const_data_ptr_t data, idx_t length) {
+			    if (!into_targets) {
+				    body_out.append(const_char_ptr_cast(data), length);
+			    } else if (!sink->Write(data, length)) {
+				    throw TransportException("request to '" + url + "' returned more bytes than it asked for");
+			    }
+			    return !context.IsCancelled();
+		    });
+		response = run(info);
+	} else if (method == HttpMethod::Get) {
 		GetRequestInfo info(
 		    url, headers, *params, [&](const HTTPResponse &) { return !context.IsCancelled(); }, nullptr);
 		response = run(info);
-	} else if (method == HttpMethod::Put) {
-		body_in = DrainRequestBody(request, context);
-		PutRequestInfo info(url, headers, *params, body_in.data(), body_in.size(), content_type);
-		response = run(info);
+	} else if (sends_body) {
+		AzureWriteBodyStream *stream = nullptr;
+		HTTPBodyPiece drained;
+		std::span<const HTTPBodyPiece> body;
+		if (context.TryGetValue(AzureWriteBodyKey(), stream) && request.GetBodyStream() == stream) {
+			body = stream->Pieces();
+		} else {
+			body_in = DrainRequestBody(request, context);
+			drained = {body_in.data(), body_in.size()};
+			body = {&drained, 1};
+		}
+		if (method == HttpMethod::Put) {
+			PutRequestInfo info(url, headers, *params, body, content_type);
+			response = run(info);
+		} else {
+			PatchRequestInfo info(url, headers, *params, body, content_type);
+			response = run(info);
+		}
 	} else if (method == HttpMethod::Post) {
 		body_in = DrainRequestBody(request, context);
 		PostRequestInfo info(url, headers, *params, body_in.data(), body_in.size());
@@ -163,6 +198,27 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 }
 
 } // namespace
+
+AzureWriteBodyStream::AzureWriteBodyStream(std::span<const HTTPBodyPiece> pieces_p)
+    : pieces(pieces_p), reader(pieces_p) {
+	for (auto &piece : pieces) {
+		size += piece.size;
+	}
+}
+
+size_t AzureWriteBodyStream::OnRead(uint8_t *buffer, size_t count, Azure::Core::Context const &context) {
+	return reader.Read(buffer, count);
+}
+
+const Azure::Core::Context::Key &AzureReadTargetsKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
+
+const Azure::Core::Context::Key &AzureWriteBodyKey() {
+	static const Azure::Core::Context::Key key;
+	return key;
+}
 
 std::shared_ptr<Azure::Core::Http::HttpTransport> CreateDuckDBTransport(optional_ptr<FileOpener> opener,
                                                                         const std::string &proxy,

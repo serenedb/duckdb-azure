@@ -34,6 +34,7 @@ public:
 	void StageWriteBuffer();
 	void Sync(bool close = false);
 	void Close() override;
+	void Abort() override;
 
 public:
 	Azure::Storage::Files::DataLake::DataLakeFileClient file_client;
@@ -50,13 +51,15 @@ class AzureDfsStorageFileSystem : public AzureStorageFileSystem {
 public:
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 	bool ListFilesExtended(const string &path_in, const std::function<void(OpenFileInfo &info)> &callback,
-	                       optional_ptr<FileOpener> opener) override;
+	                       optional_ptr<FileOpener> opener, const ListFilesOptions &listing) override;
 	bool SupportsListFilesExtended() const override {
 		return true;
 	}
 
 	bool CanHandleFile(const string &fpath) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
 	FileExistence TryDirectoryExists(const string &filename, optional_ptr<FileOpener> opener,
 	                                 optional_ptr<ErrorData> error) override;
 	FileExistence TryFileExists(const string &filename, optional_ptr<FileOpener> opener,
@@ -73,6 +76,8 @@ public:
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
 public:
 	static const string SCHEME;
@@ -90,7 +95,7 @@ protected:
 	unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                         optional_ptr<FileOpener> opener) override;
 
-	void ReadRange(AzureFileHandle &handle, idx_t file_offset, char *buffer_out, idx_t buffer_out_len) override;
+	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) override;
 };
 
 } // namespace duckdb
