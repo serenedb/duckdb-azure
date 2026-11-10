@@ -798,7 +798,7 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 		return;
 	}
 
-	// Transport failures are retried below (duckdb retry + SDK RetryPolicy);
+	// Transport failures are retried below (duckdb retry);
 	// a delivered-but-short body is deterministic, so it fails immediately.
 	for (bool reconnected = false;; reconnected = true) {
 		try {
