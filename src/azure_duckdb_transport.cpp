@@ -124,7 +124,6 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 		body_in = DrainRequestBody(request, context);
 		PostRequestInfo info(url, headers, *params, body_in.data(), body_in.size());
 		response = run(info);
-		body_out = std::move(info.buffer_out);
 	} else if (method == HttpMethod::Head) {
 		HeadRequestInfo info(url, headers, *params);
 		response = run(info);
