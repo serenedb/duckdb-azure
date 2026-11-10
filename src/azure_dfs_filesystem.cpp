@@ -206,6 +206,9 @@ bool AzureDfsStorageFileSystem::CanHandleFile(const string &fpath) {
 FileExistence AzureDfsStorageFileSystem::TryDirectoryExists(const string &dirname, optional_ptr<FileOpener> opener,
                                                             optional_ptr<ErrorData> error) {
 	try {
+		if (ParseUrl(dirname).path.empty()) {
+			return FileExistence::EXISTS;
+		}
 		auto handle = OpenFile(dirname, FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS, opener);
 		const bool is_dir = handle && handle->Cast<AzureDfsStorageFileHandle>().GetType() == FileType::FILE_TYPE_DIR;
 		return is_dir ? FileExistence::EXISTS : FileExistence::MISSING;
@@ -215,13 +218,27 @@ FileExistence AzureDfsStorageFileSystem::TryDirectoryExists(const string &dirnam
 }
 
 void AzureDfsStorageFileSystem::CreateDirectory(const string &dirname, optional_ptr<FileOpener> opener) {
+	CreateDirectoryExtended(dirname, {CreateDirectoryMode::SINGLE}, opener);
+}
+
+bool AzureDfsStorageFileSystem::CreateDirectoryExtended(const string &dirname, const CreateDirectoryOptions &options,
+                                                        optional_ptr<FileOpener> opener) {
 	if (!opener) {
 		throw InternalException("Unsupported(INTERNAL): cannot create an Azure directory without FileOpener");
 	}
 	auto dir_url = ParseUrl(dirname);
+	if (dir_url.path.empty()) {
+		return false;
+	}
 	auto storage_context = GetOrCreateStorageContext(opener, dirname, dir_url);
 	auto file_system_client = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(dir_url.container);
-	file_system_client.GetDirectoryClient(dir_url.path).Create();
+	try {
+		return file_system_client.GetDirectoryClient(dir_url.path).CreateIfNotExists().Value.Created;
+	} catch (const Azure::Storage::StorageException &e) {
+		throw IOException({{"status_code", std::to_string(int(e.StatusCode))}},
+		                  "AzureDfsStorageFileSystem creating directory '%s' failed with %s Reason Phrase: %s", dirname,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
 }
 
 FileExistence AzureDfsStorageFileSystem::TryFileExists(const string &filename, optional_ptr<FileOpener> opener,
@@ -255,6 +272,36 @@ bool AzureDfsStorageFileSystem::TryRemoveFile(const string &filename, optional_p
 	auto file_system_client = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(url.container);
 	auto file_client = file_system_client.GetFileClient(url.path);
 	return file_client.DeleteIfExists().Value.Deleted;
+}
+
+void AzureDfsStorageFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener) {
+	auto url = ParseUrl(directory);
+	auto storage_context = GetOrCreateStorageContext(opener, directory, url);
+	auto file_system_client = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(url.container);
+	try {
+		file_system_client.GetDirectoryClient(url.path).DeleteRecursiveIfExists();
+	} catch (Azure::Storage::StorageException &e) {
+		throw IOException("AzureDfsStorageFileSystem removal of directory %s failed with %s Reason Phrase: %s",
+		                  directory, e.ErrorCode, e.ReasonPhrase);
+	}
+}
+
+void AzureDfsStorageFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
+	if (source == target) {
+		return;
+	}
+	auto source_url = ParseUrl(source);
+	auto target_url = ParseUrl(target);
+	auto storage_context = GetOrCreateStorageContext(opener, source, source_url);
+	auto file_system_client = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(source_url.container);
+	Azure::Storage::Files::DataLake::RenameFileOptions options;
+	options.DestinationFileSystem = target_url.container;
+	try {
+		file_system_client.RenameFile(source_url.path, target_url.path, options);
+	} catch (Azure::Storage::StorageException &e) {
+		throw IOException("AzureDfsStorageFileSystem move of %s to %s failed with %s Reason Phrase: %s", source, target,
+		                  e.ErrorCode, e.ReasonPhrase);
+	}
 }
 
 vector<OpenFileInfo> AzureDfsStorageFileSystem::Glob(const string &path, FileOpener *opener) {

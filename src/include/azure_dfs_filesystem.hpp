@@ -58,6 +58,8 @@ public:
 
 	bool CanHandleFile(const string &fpath) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	bool CreateDirectoryExtended(const string &directory, const CreateDirectoryOptions &options,
+	                             optional_ptr<FileOpener> opener = nullptr) override;
 	FileExistence TryDirectoryExists(const string &filename, optional_ptr<FileOpener> opener,
 	                                 optional_ptr<ErrorData> error) override;
 	FileExistence TryFileExists(const string &filename, optional_ptr<FileOpener> opener,
@@ -74,6 +76,8 @@ public:
 
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
+	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 
 public:
 	static const string SCHEME;
