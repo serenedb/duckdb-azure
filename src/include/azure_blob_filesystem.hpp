@@ -7,6 +7,7 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/main/http/http_util.hpp"
+#include "duckdb/parallel/task_executor.hpp"
 
 #include <azure/core/context.hpp>
 #include <azure/storage/blobs/blob_client.hpp>
@@ -60,8 +61,6 @@ public:
 	void Sync();
 	void Close() override;
 	void Abort() override;
-	void StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept;
-	void FinishStaging(ErrorData error) noexcept;
 	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient() {
 		return blob_client.Get();
 	}
@@ -81,16 +80,15 @@ public:
 
 private:
 	void PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body);
-	void AwaitStaging(idx_t limit);
-	void AwaitStagingNoThrow() noexcept;
+	//! Stages a block on behalf of a background task, whose executor keeps the first error for the writer
+	void StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body);
 	Azure::Storage::Blobs::BlockBlobClient CurrentBlobClient();
 
 	DatabaseInstance &db;
 	Azure::Core::Context staging_context;
 	AzureHandleClient<Azure::Storage::Blobs::BlockBlobClient> blob_client;
-	annotated_mutex staging_lock;
-	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
-	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
+	//! Stages blocks in the background, at most write_blocks_in_flight at once; made by the first of them
+	unique_ptr<TaskExecutor> staging;
 };
 
 class AzureBlobStorageFileSystem : public AzureStorageFileSystem {
