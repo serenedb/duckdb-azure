@@ -103,6 +103,8 @@ public:
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void ReadScattered(FileHandle &handle, std::span<const FileReadTarget> targets, idx_t location) override;
+	void ReadStreamed(FileHandle &handle, std::span<const FileReadTarget> targets, idx_t location,
+	                  FileReadProgress &progress) override;
 	bool CanSeek() override {
 		return true;
 	}
@@ -136,8 +138,9 @@ protected:
 	virtual duckdb::unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                                         optional_ptr<FileOpener> opener) = 0;
 	//! GETs exactly the bytes [targets] take at [file_offset], into them in order; a target without data skips its
-	//! bytes
-	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) = 0;
+	//! bytes. [progress], when given, is told of the targets filled as the bytes arrive
+	virtual void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets,
+	                       optional_ptr<FileReadProgress> progress) = 0;
 
 	virtual const string &GetContextPrefix() const = 0;
 	shared_ptr<AzureContextState> GetOrCreateStorageContext(optional_ptr<FileOpener> opener, const string &path,

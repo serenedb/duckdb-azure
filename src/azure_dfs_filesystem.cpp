@@ -435,9 +435,10 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 }
 
 void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
-                                          std::span<const FileReadTarget> targets) {
+                                          std::span<const FileReadTarget> targets,
+                                          optional_ptr<FileReadProgress> progress) {
 	auto &afh = handle.Cast<AzureDfsStorageFileHandle>();
-	FileReadTargetWriter sink(targets);
+	FileReadTargetWriter sink(targets, progress);
 	const auto buffer_out_len = sink.Capacity();
 	if (buffer_out_len == 0) {
 		return;

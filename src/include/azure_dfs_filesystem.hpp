@@ -94,7 +94,8 @@ protected:
 	unique_ptr<AzureFileHandle> CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
 	                                         optional_ptr<FileOpener> opener) override;
 
-	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets) override;
+	void ReadRange(AzureFileHandle &handle, idx_t file_offset, std::span<const FileReadTarget> targets,
+	               optional_ptr<FileReadProgress> progress) override;
 };
 
 } // namespace duckdb

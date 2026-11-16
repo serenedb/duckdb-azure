@@ -122,6 +122,9 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 			    const auto status = static_cast<int>(response.status);
 			    into_targets = status >= 200 && status < 300;
 			    sink->Reset();
+			    if (response.status == HTTPStatusCode::PartialContent_206) {
+				    sink->Publish();
+			    }
 			    return !context.IsCancelled();
 		    },
 		    [&](const_data_ptr_t data, idx_t length) {

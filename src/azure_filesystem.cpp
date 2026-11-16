@@ -154,7 +154,7 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			return;
 		}
 		const FileReadTarget target {data_ptr_cast(buffer), to_read};
-		ReadRange(hfh, location, std::span(&target, 1));
+		ReadRange(hfh, location, std::span(&target, 1), nullptr);
 		DUCKDB_LOG_FILE_SYSTEM_READ(handle, nr_bytes, location);
 		return;
 	}
@@ -189,14 +189,14 @@ void AzureStorageFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 			// Bypass buffer if we read more than buffer size
 			if (to_read > new_buffer_available) {
 				const FileReadTarget target {data_ptr_cast(buffer) + buffer_offset, to_read};
-				ReadRange(hfh, location + buffer_offset, std::span(&target, 1));
+				ReadRange(hfh, location + buffer_offset, std::span(&target, 1), nullptr);
 				hfh.buffer_available = 0;
 				hfh.buffer_idx = 0;
 				hfh.file_offset += to_read;
 				break;
 			} else {
 				const FileReadTarget target {data_ptr_cast(hfh.read_buffer.get()), new_buffer_available};
-				ReadRange(hfh, hfh.file_offset, std::span(&target, 1));
+				ReadRange(hfh, hfh.file_offset, std::span(&target, 1), nullptr);
 				hfh.buffer_available = new_buffer_available;
 				hfh.buffer_idx = 0;
 				hfh.buffer_start = hfh.file_offset;
@@ -211,7 +211,16 @@ void AzureStorageFileSystem::ReadScattered(FileHandle &handle, std::span<const F
                                            idx_t location) {
 	const auto size = FileReadTarget::TotalSize(targets);
 	if (size != 0) {
-		ReadRange(handle.Cast<AzureFileHandle>(), location, targets);
+		ReadRange(handle.Cast<AzureFileHandle>(), location, targets, nullptr);
+	}
+	DUCKDB_LOG_FILE_SYSTEM_READ(handle, size, location);
+}
+
+void AzureStorageFileSystem::ReadStreamed(FileHandle &handle, std::span<const FileReadTarget> targets, idx_t location,
+                                          FileReadProgress &progress) {
+	const auto size = FileReadTarget::TotalSize(targets);
+	if (size != 0) {
+		ReadRange(handle.Cast<AzureFileHandle>(), location, targets, &progress);
 	}
 	DUCKDB_LOG_FILE_SYSTEM_READ(handle, size, location);
 }

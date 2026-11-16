@@ -759,9 +759,10 @@ void AzureBlobStorageFileSystem::RemoveDirectory(const string &directory, option
 }
 
 void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_offset,
-                                           std::span<const FileReadTarget> targets) {
+                                           std::span<const FileReadTarget> targets,
+                                           optional_ptr<FileReadProgress> progress) {
 	auto &afh = handle.Cast<AzureBlobStorageFileHandle>();
-	FileReadTargetWriter sink(targets);
+	FileReadTargetWriter sink(targets, progress);
 	const auto buffer_out_len = sink.Capacity();
 	if (buffer_out_len == 0) {
 		return;
