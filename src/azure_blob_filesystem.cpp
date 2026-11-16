@@ -252,19 +252,13 @@ private:
 AzureBlobStorageFileHandle::AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info,
                                                        FileOpenFlags flags, const AzureOptions &opts,
                                                        Azure::Storage::Blobs::BlockBlobClient blob_client_p,
-                                                       optional_ptr<DatabaseInstance> db_p)
+                                                       DatabaseInstance &db_p)
     : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, opts), db(db_p),
-      blob_client(make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(blob_client_p))) {
+      blob_client(std::move(blob_client_p)) {
 }
 
-shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> AzureBlobStorageFileHandle::BlobClient() {
-	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
-	return blob_client;
-}
-
-void AzureBlobStorageFileHandle::SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client) {
-	annotated_lock_guard<annotated_mutex> guard(blob_client_lock);
-	blob_client = make_shared_ptr<const Azure::Storage::Blobs::BlockBlobClient>(std::move(client));
+Azure::Storage::Blobs::BlockBlobClient AzureBlobStorageFileHandle::CurrentBlobClient() {
+	return file_system.Cast<AzureBlobStorageFileSystem>().ConnectBlob(db, path);
 }
 
 AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
@@ -272,9 +266,11 @@ AzureBlobStorageFileHandle::~AzureBlobStorageFileHandle() {
 }
 
 void AzureBlobStorageFileHandle::PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body) {
-	AzureWriteBodyStream body_stream(body);
-	BlobClient()->StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(),
-	                         staging_context.WithValue(AzureWriteBodyKey(), &body_stream));
+	Send([&](const Azure::Storage::Blobs::BlockBlobClient &client) {
+		AzureWriteBodyStream body_stream(body);
+		client.StageBlock(block_id, body_stream, Azure::Storage::Blobs::StageBlockOptions(),
+		                  staging_context.WithValue(AzureWriteBodyKey(), &body_stream));
+	});
 }
 
 void AzureBlobStorageFileHandle::StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept {
@@ -339,7 +335,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 		return;
 	}
 	auto block_id = MakeBlockId(static_cast<uint32_t>(committed_block_count) + staged_block_count);
-	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(*db).NumberOfAsyncThreads() == 0) {
+	if (options.write_blocks_in_flight <= 1 || TaskScheduler::GetScheduler(db).NumberOfAsyncThreads() == 0) {
 		PutBlock(block_id, write_block.Pieces());
 		staged_block_count++;
 		write_block = AzureWriteBlock();
@@ -352,7 +348,7 @@ void AzureBlobStorageFileHandle::StageWriteBuffer() {
 	}
 	staged_block_count++;
 	auto task = make_shared_ptr<AzureStageBlockTask>(*this, std::move(block_id), std::exchange(write_block, {}));
-	auto &scheduler = TaskScheduler::GetScheduler(*db);
+	auto &scheduler = TaskScheduler::GetScheduler(db);
 	scheduler.ScheduleTask(scheduler.GetDatabaseProducer(), std::move(task), TaskSchedulerType::ASYNC);
 }
 
@@ -385,7 +381,8 @@ void AzureBlobStorageFileHandle::Sync() {
 		for (uint32_t i = 0; i < total; i++) {
 			all_ids.push_back(MakeBlockId(i));
 		}
-		auto res = BlobClient()->CommitBlockList(all_ids);
+		auto res =
+		    Send([&](const Azure::Storage::Blobs::BlockBlobClient &client) { return client.CommitBlockList(all_ids); });
 		last_modified = AzureBlobStorageFileSystem::ToTimestamp(res.Value.LastModified);
 		etag = AzureBlobStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
@@ -436,7 +433,7 @@ unique_ptr<AzureFileHandle> AzureBlobStorageFileSystem::CreateHandle(const OpenF
 	auto blob_client = container.GetBlockBlobClient(parsed_url.path);
 
 	auto handle = make_uniq<AzureBlobStorageFileHandle>(*this, info, flags, storage_context->options,
-	                                                    std::move(blob_client), FileOpener::TryGetDatabase(opener));
+	                                                    std::move(blob_client), *FileOpener::TryGetDatabase(opener));
 	if (!handle->PostConstruct()) {
 		return nullptr;
 	}
@@ -770,45 +767,44 @@ void AzureBlobStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_o
 
 	// Transport failures are retried below (duckdb retry);
 	// a delivered-but-short body is deterministic, so it fails immediately.
-	for (bool reconnected = false;; reconnected = true) {
-		try {
-			Azure::Core::Http::HttpRange range;
-			range.Offset = (int64_t)file_offset;
-			range.Length = (int64_t)buffer_out_len;
-			Azure::Storage::Blobs::DownloadBlobOptions options;
-			options.Range = range;
-			if (!afh.etag.empty()) {
-				options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
-			}
-			afh.BlobClient()->Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
-			break;
-		} catch (const Azure::Storage::StorageException &e) {
-			if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
-				throw IOException(
-				    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
-				    "ETag is no longer %s",
-				    afh.path, afh.etag);
-			}
-			// A secret replaced since the handle opened, for one whose credentials expired, signs the retry
-			if (!reconnected && e.StatusCode == Azure::Core::Http::HttpStatusCode::Forbidden) {
-				DatabaseFileOpener opener(*afh.Database());
-				auto parsed_url = ParseUrl(afh.path);
-				auto context = GetOrCreateStorageContext(&opener, afh.path, parsed_url);
-				afh.SetBlobClient(context->As<AzureBlobContextState>()
-				                      .GetBlobContainerClient(parsed_url.container)
-				                      .GetBlockBlobClient(parsed_url.path));
-				continue;
-			}
-			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
-			                  e.ErrorCode, e.ReasonPhrase);
-		} catch (const Azure::Core::RequestFailedException &e) {
-			throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
+	try {
+		Azure::Core::Http::HttpRange range;
+		range.Offset = (int64_t)file_offset;
+		range.Length = (int64_t)buffer_out_len;
+		Azure::Storage::Blobs::DownloadBlobOptions options;
+		options.Range = range;
+		if (!afh.etag.empty()) {
+			options.AccessConditions.IfMatch = Azure::ETag("\"" + afh.etag + "\"");
 		}
+		afh.Send([&](const Azure::Storage::Blobs::BlockBlobClient &client) {
+			client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
+		});
+	} catch (const Azure::Storage::StorageException &e) {
+		if (e.StatusCode == Azure::Core::Http::HttpStatusCode::PreconditionFailed) {
+			throw IOException(
+			    "AzureBlobStorageFileSystem Read to '%s' failed: the blob changed after it was opened, its "
+			    "ETag is no longer %s",
+			    afh.path, afh.etag);
+		}
+		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed with %s Reason Phrase: %s", afh.path,
+		                  e.ErrorCode, e.ReasonPhrase);
+	} catch (const Azure::Core::RequestFailedException &e) {
+		throw IOException("AzureBlobStorageFileSystem Read to '%s' failed: %s", afh.path, e.what());
 	}
 	if (sink.Written() < buffer_out_len) {
 		throw IOException("AzureBlobStorageFileSystem Read to '%s' returned %llu of %llu requested bytes", afh.path,
 		                  (uint64_t)sink.Written(), (uint64_t)buffer_out_len);
 	}
+}
+
+Azure::Storage::Blobs::BlockBlobClient AzureBlobStorageFileSystem::ConnectBlob(DatabaseInstance &db,
+                                                                               const string &path) {
+	DatabaseFileOpener opener(db);
+	const auto parsed_url = ParseUrl(path);
+	return GetOrCreateStorageContext(&opener, path, parsed_url)
+	    ->As<AzureBlobContextState>()
+	    .GetBlobContainerClient(parsed_url.container)
+	    .GetBlockBlobClient(parsed_url.path);
 }
 
 shared_ptr<AzureContextState> AzureBlobStorageFileSystem::CreateStorageContext(optional_ptr<FileOpener> opener,
@@ -853,7 +849,7 @@ void AzureBlobStorageFileSystem::WriteAt(FileHandle &handle, const_data_ptr_t da
 		afh.write_block.Hold(data, size, std::move(hold));
 		afh.StageIfFull();
 	} else {
-		auto &allocator = BufferManager::GetBufferManager(*afh.Database()).GetBufferAllocator();
+		auto &allocator = BufferManager::GetBufferManager(afh.Database()).GetBufferAllocator();
 		for (idx_t done = 0; done < size;) {
 			done += afh.write_block.Copy(allocator, afh.options.write_block_size, data + done, size - done);
 			afh.StageIfFull();

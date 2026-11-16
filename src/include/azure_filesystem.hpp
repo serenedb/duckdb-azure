@@ -4,11 +4,13 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/main/client_context_state.hpp"
 
 #include <azure/core/datetime.hpp>
+#include <azure/storage/common/storage_exception.hpp>
 #include <cstdint>
 #include <ctime>
 
@@ -50,6 +52,43 @@ protected:
 
 protected:
 	bool is_valid;
+};
+
+//! The client a handle's requests go through. A request refused with 403 is sent once more through a client made
+//! from the secret as it is now, which then replaces the handle's: credentials that expired may have been replaced
+//! since the handle opened
+template <class CLIENT>
+class AzureHandleClient {
+public:
+	explicit AzureHandleClient(CLIENT client_p) : client(make_shared_ptr<const CLIENT>(std::move(client_p))) {
+	}
+
+	shared_ptr<const CLIENT> Get() {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		return client;
+	}
+
+	//! Sends [request] through the client, and through [current]() after a 403
+	template <class REQUEST, class CURRENT>
+	auto Send(REQUEST &&request, CURRENT &&current) -> decltype(request(std::declval<const CLIENT &>())) {
+		try {
+			return request(*Get());
+		} catch (const Azure::Storage::StorageException &e) {
+			if (e.StatusCode != Azure::Core::Http::HttpStatusCode::Forbidden) {
+				throw;
+			}
+		}
+		auto fresh = make_shared_ptr<const CLIENT>(current());
+		{
+			annotated_lock_guard<annotated_mutex> guard(lock);
+			client = fresh;
+		}
+		return request(*fresh);
+	}
+
+private:
+	annotated_mutex lock;
+	shared_ptr<const CLIENT> client DUCKDB_GUARDED_BY(lock);
 };
 
 class AzureStorageFileSystem;

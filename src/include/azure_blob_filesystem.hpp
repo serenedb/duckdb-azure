@@ -52,7 +52,7 @@ class AzureBlobStorageFileHandle : public AzureFileHandle {
 public:
 	AzureBlobStorageFileHandle(AzureBlobStorageFileSystem &fs, const OpenFileInfo &info, FileOpenFlags flags,
 	                           const AzureOptions &options, Azure::Storage::Blobs::BlockBlobClient blob_client,
-	                           optional_ptr<DatabaseInstance> db);
+	                           DatabaseInstance &db);
 	~AzureBlobStorageFileHandle() override;
 
 	void StageWriteBuffer();
@@ -62,10 +62,15 @@ public:
 	void Abort() override;
 	void StageBlock(const string &block_id, std::span<const HTTPBodyPiece> body) noexcept;
 	void FinishStaging(ErrorData error) noexcept;
-	//! The client requests go through: the one the handle was opened with, or one SetBlobClient installed since
-	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient();
-	void SetBlobClient(Azure::Storage::Blobs::BlockBlobClient client);
-	optional_ptr<DatabaseInstance> Database() const {
+	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> BlobClient() {
+		return blob_client.Get();
+	}
+	//! Sends [request] through the blob's client, and after a 403 through one of the secret as it is now
+	template <class REQUEST>
+	auto Send(REQUEST &&request) {
+		return blob_client.Send(request, [this] { return CurrentBlobClient(); });
+	}
+	DatabaseInstance &Database() const {
 		return db;
 	}
 
@@ -78,11 +83,11 @@ private:
 	void PutBlock(const string &block_id, std::span<const HTTPBodyPiece> body);
 	void AwaitStaging(idx_t limit);
 	void AwaitStagingNoThrow() noexcept;
+	Azure::Storage::Blobs::BlockBlobClient CurrentBlobClient();
 
-	optional_ptr<DatabaseInstance> db;
+	DatabaseInstance &db;
 	Azure::Core::Context staging_context;
-	annotated_mutex blob_client_lock;
-	shared_ptr<const Azure::Storage::Blobs::BlockBlobClient> blob_client DUCKDB_GUARDED_BY(blob_client_lock);
+	AzureHandleClient<Azure::Storage::Blobs::BlockBlobClient> blob_client;
 	annotated_mutex staging_lock;
 	idx_t blocks_in_flight DUCKDB_GUARDED_BY(staging_lock) = 0;
 	ErrorData staging_error DUCKDB_GUARDED_BY(staging_lock);
@@ -125,6 +130,8 @@ public:
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	void RemoveFiles(const vector<string> &filenames, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	//! A client for the blob at [path], made from the secret as it is now
+	Azure::Storage::Blobs::BlockBlobClient ConnectBlob(DatabaseInstance &db, const string &path);
 
 public:
 	static const string SCHEME;

@@ -28,16 +28,24 @@ class AzureDfsStorageFileSystem;
 class AzureDfsStorageFileHandle : public AzureFileHandle {
 public:
 	AzureDfsStorageFileHandle(AzureDfsStorageFileSystem &fs, const OpenFileInfo &info, FileOpenFlags flags,
-	                          const AzureOptions &options, Azure::Storage::Files::DataLake::DataLakeFileClient client);
+	                          const AzureOptions &options, Azure::Storage::Files::DataLake::DataLakeFileClient client,
+	                          DatabaseInstance &db);
 	~AzureDfsStorageFileHandle() override = default;
 
 	void StageWriteBuffer();
 	void Sync(bool close = false);
 	void Close() override;
 	void Abort() override;
+	shared_ptr<const Azure::Storage::Files::DataLake::DataLakeFileClient> FileClient() {
+		return file_client.Get();
+	}
+	//! Sends [request] through the file's client, and after a 403 through one of the secret as it is now
+	template <class REQUEST>
+	auto Send(REQUEST &&request) {
+		return file_client.Send(request, [this] { return CurrentFileClient(); });
+	}
 
 public:
-	Azure::Storage::Files::DataLake::DataLakeFileClient file_client;
 	duckdb::unique_ptr<data_t[]> write_buffer;
 	idx_t write_buffer_offset = 0;
 	// Bytes sent to Append (staged on server, committed or not): always <= file_offset,
@@ -45,6 +53,12 @@ public:
 	idx_t staged_offset = 0;
 	uint32_t staged_block_count = 0;
 	uint32_t committed_block_count = 0;
+
+private:
+	Azure::Storage::Files::DataLake::DataLakeFileClient CurrentFileClient();
+
+	DatabaseInstance &db;
+	AzureHandleClient<Azure::Storage::Files::DataLake::DataLakeFileClient> file_client;
 };
 
 class AzureDfsStorageFileSystem : public AzureStorageFileSystem {
@@ -77,6 +91,8 @@ public:
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	virtual bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
+	//! A client for the file at [path], made from the secret as it is now
+	Azure::Storage::Files::DataLake::DataLakeFileClient ConnectFile(DatabaseInstance &db, const string &path);
 
 public:
 	static const string SCHEME;

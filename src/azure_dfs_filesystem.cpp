@@ -12,6 +12,7 @@
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/logging/file_system_logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include "duckdb/main/database_file_opener.hpp"
 
 #include <algorithm>
 #include <azure/storage/blobs/blob_options.hpp>
@@ -108,8 +109,13 @@ AzureDfsContextState::GetDfsFileSystemClient(const std::string &file_system_name
 //////// AzureDfsContextState ////////
 AzureDfsStorageFileHandle::AzureDfsStorageFileHandle(AzureDfsStorageFileSystem &fs, const OpenFileInfo &info,
                                                      FileOpenFlags flags, const AzureOptions &options,
-                                                     Azure::Storage::Files::DataLake::DataLakeFileClient client)
-    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, options), file_client(std::move(client)) {
+                                                     Azure::Storage::Files::DataLake::DataLakeFileClient client,
+                                                     DatabaseInstance &db_p)
+    : AzureFileHandle(fs, info, flags, FileType::FILE_TYPE_INVALID, options), db(db_p), file_client(std::move(client)) {
+}
+
+Azure::Storage::Files::DataLake::DataLakeFileClient AzureDfsStorageFileHandle::CurrentFileClient() {
+	return file_system.Cast<AzureDfsStorageFileSystem>().ConnectFile(db, path);
 }
 
 void AzureDfsStorageFileHandle::StageWriteBuffer() {
@@ -117,9 +123,11 @@ void AzureDfsStorageFileHandle::StageWriteBuffer() {
 		return;
 	}
 	const HTTPBodyPiece body {write_buffer.get(), write_buffer_offset};
-	AzureWriteBodyStream body_stream({&body, 1});
-	file_client.Append(body_stream, staged_offset, Azure::Storage::Files::DataLake::AppendFileOptions(),
-	                   Azure::Core::Context().WithValue(AzureWriteBodyKey(), &body_stream));
+	Send([&](const Azure::Storage::Files::DataLake::DataLakeFileClient &client) {
+		AzureWriteBodyStream body_stream({&body, 1});
+		client.Append(body_stream, staged_offset, Azure::Storage::Files::DataLake::AppendFileOptions(),
+		              Azure::Core::Context().WithValue(AzureWriteBodyKey(), &body_stream));
+	});
 	staged_offset += write_buffer_offset;
 	staged_block_count++;
 	write_buffer_offset = 0;
@@ -139,7 +147,9 @@ void AzureDfsStorageFileHandle::Sync(bool close) {
 		}
 		Azure::Storage::Files::DataLake::FlushFileOptions flush_opts;
 		flush_opts.Close = close;
-		auto res = file_client.Flush(staged_offset, flush_opts);
+		auto res = Send([&](const Azure::Storage::Files::DataLake::DataLakeFileClient &client) {
+			return client.Flush(staged_offset, flush_opts);
+		});
 		last_modified = AzureStorageFileSystem::ToTimestamp(res.Value.LastModified);
 		etag = AzureStorageFileSystem::StripETagQuotes(res.Value.ETag.ToString());
 		committed_block_count += staged_block_count;
@@ -165,6 +175,17 @@ void AzureDfsStorageFileHandle::Abort() {
 }
 
 //////// AzureDfsStorageFileSystem ////////
+static Azure::Storage::Files::DataLake::DataLakeFileClient FileClientOf(AzureContextState &context,
+                                                                        const AzureParsedUrl &url) {
+	// A trailing '/' is only a directory hint, not part of the resource name. Some DFS endpoints (e.g. OneLake)
+	// reject a GetProperties on a trailing-slash path with 403 AuthenticationFailed, so strip it for the client.
+	auto file_path = url.path;
+	if (file_path.size() > 1 && file_path.back() == '/') {
+		file_path.pop_back();
+	}
+	return context.As<AzureDfsContextState>().GetDfsFileSystemClient(url.container).GetFileClient(file_path);
+}
+
 unique_ptr<AzureFileHandle> AzureDfsStorageFileSystem::CreateHandle(const OpenFileInfo &info, FileOpenFlags flags,
                                                                     optional_ptr<FileOpener> opener) {
 	if (!opener) {
@@ -182,21 +203,20 @@ unique_ptr<AzureFileHandle> AzureDfsStorageFileSystem::CreateHandle(const OpenFi
 
 	auto parsed_url = ParseUrl(info.path);
 	auto storage_context = GetOrCreateStorageContext(opener, info.path, parsed_url);
-	auto file_system_client = storage_context->As<AzureDfsContextState>().GetDfsFileSystemClient(parsed_url.container);
-
-	// A trailing '/' is only a directory hint, not part of the resource name. Some DFS endpoints (e.g. OneLake)
-	// reject a GetProperties on a trailing-slash path with 403 AuthenticationFailed, so strip it for the client.
-	auto file_path = parsed_url.path;
-	if (file_path.size() > 1 && file_path.back() == '/') {
-		file_path.pop_back();
-	}
-
 	auto handle = make_uniq<AzureDfsStorageFileHandle>(*this, info, flags, storage_context->options,
-	                                                   file_system_client.GetFileClient(file_path));
+	                                                   FileClientOf(*storage_context, parsed_url),
+	                                                   *FileOpener::TryGetDatabase(opener));
 	if (!handle->PostConstruct()) {
 		return nullptr;
 	}
 	return std::move(handle);
+}
+
+Azure::Storage::Files::DataLake::DataLakeFileClient AzureDfsStorageFileSystem::ConnectFile(DatabaseInstance &db,
+                                                                                           const string &path) {
+	DatabaseFileOpener opener(db);
+	const auto parsed_url = ParseUrl(path);
+	return FileClientOf(*GetOrCreateStorageContext(&opener, path, parsed_url), parsed_url);
 }
 
 bool AzureDfsStorageFileSystem::CanHandleFile(const string &fpath) {
@@ -408,7 +428,7 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 		if (afh.flags.ExclusiveCreate()) {
 			options.AccessConditions.IfNoneMatch = Azure::ETag::Any();
 		}
-		auto res_create = afh.file_client.Create(options);
+		auto res_create = afh.FileClient()->Create(options);
 		set_props(false, 0, ToTimestamp(res_create.Value.LastModified), res_create.Value.ETag.ToString());
 	};
 	auto truncate_file = create_file;
@@ -417,7 +437,7 @@ void AzureDfsStorageFileSystem::LoadRemoteFileInfo(AzureFileHandle &handle) {
 		return create_file();
 	}
 	try {
-		auto res_props = afh.file_client.GetProperties();
+		auto res_props = afh.FileClient()->GetProperties();
 		if (afh.flags.OpenForWriting() && afh.flags.OverwriteExistingFile()) {
 			return truncate_file();
 		}
@@ -450,7 +470,9 @@ void AzureDfsStorageFileSystem::ReadRange(AzureFileHandle &handle, idx_t file_of
 		range.Length = (int64_t)buffer_out_len;
 		Azure::Storage::Files::DataLake::DownloadFileOptions options;
 		options.Range = range;
-		afh.file_client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
+		afh.Send([&](const Azure::Storage::Files::DataLake::DataLakeFileClient &client) {
+			client.Download(options, Azure::Core::Context().WithValue(AzureReadTargetsKey(), &sink));
+		});
 	} catch (const Azure::Storage::StorageException &e) {
 		throw IOException("AzureDfsStorageFileSystem Read to '%s' failed with %s Reason Phrase: "
 		                  "%s",
