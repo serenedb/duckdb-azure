@@ -132,6 +132,7 @@ std::unique_ptr<Azure::Core::Http::RawResponse> DuckDBTransport::Send(Azure::Cor
 			    }
 			    return !context.IsCancelled();
 		    });
+		info.expected_bytes = sink->Capacity();
 		response = run(info);
 	} else if (method == HttpMethod::Get) {
 		GetRequestInfo info(
